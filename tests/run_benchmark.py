@@ -1,69 +1,43 @@
 """
-基准验证脚本 — 对比论文 Table 9 结果。
+Benchmark runner for comparing LSND results against paper baselines.
 
-用法:
-  快速测试 (Baltic, 120s):
-    python -m tests.run_benchmark --quick
-
-  完整测试 (所有实例, 论文推荐时间):
-    python -m tests.run_benchmark --full
-
-  指定实例和时间:
-    python -m tests.run_benchmark --instance Baltic --time 300
+Examples:
+  python -m tests.run_benchmark --instance Baltic --time 120
+  python -m tests.run_benchmark --instance Baltic --time 300 --runs 10 --seed-base 42
+  python -m tests.run_benchmark --quick
 """
 
+from __future__ import annotations
+
 import argparse
-import sys
+import statistics
 import time
-import logging
+from typing import Dict, List
 
-from src.algorithm.solver import solve_instance
+from src.algorithm.solver import SolverResult, solve_instance
+from src.paper_replay import evaluate_baltic_base_replay
+from src.data_reader import load_instance, load_distances
+from src.utils.cost_calculator import build_vessels_from_data, build_ports_from_data, build_distance_dict, CostConfig
 
-logging.basicConfig(level=logging.WARNING)
 
-# 论文 Table 9 参考值 (Base 配置)
-# 注意: 论文 Table 9 中成本值单位为 $1000 USD，此处已转换为 USD
-# Z: 目标值, Q: 收入, |R|: 航线数, Rej%: 拒绝率, F: 拒运 FFE
 PAPER_BENCHMARKS = {
     "Baltic": {
-        "time": 300,
-        "Z_best": -6_044_000,
-        "Z_median": 858_000,
-        "Q_best": 96_750_000,
-        "rotations_best": 5,
-        "reject_pct_best": 8.6,
-        "F_best": 10_850,
+        "base": {"time": 300, "Z_best": -8_365_000, "Z_median": -6_582_000, "Q_best": 98_310_000, "rotations_best": 3, "reject_pct_best": 5.0, "source": "Baltic_best_base.log"},
+        "low": {"time": 300, "Z_best": -6_104_400, "Z_median": 83_800, "Q_best": 96_175_000, "rotations_best": 4, "reject_pct_best": 8.2},
+        "high": {"time": 300, "Z_best": -15_167_800, "Z_median": -11_150_900, "Q_best": 103_150_000, "rotations_best": 4, "reject_pct_best": 0.1},
     },
     "WAF": {
-        "time": 900,
-        "Z_best": -115_361_000,
-        "Z_median": -109_470_000,
-        "Q_best": 345_800_000,
-        "rotations_best": 7,
-        "reject_pct_best": 11.7,
-        "F_best": 25_710,
+        "base": {"time": 900, "Z_best": -1_431_110_000, "Z_median": -1_371_681_000, "Q_best": 3_701_600_000, "rotations_best": 11, "reject_pct_best": 4.7},
     },
     "Mediterranean": {
-        "time": 1200,
-        "Z_best": -218_980_000,
-        "Z_median": -165_440_000,
-        "Q_best": 460_400_000,
-        "rotations_best": 8,
-        "reject_pct_best": 33.5,
-        "F_best": 65_210,
+        "base": {"time": 1200, "Z_best": 12_209_000, "Z_median": 24_934_000, "Q_best": 136_800_000, "rotations_best": 7, "reject_pct_best": 1.2},
     },
     "Pacific": {
-        "time": 3600,
-        "Z_best": -2_321_770_000,
-        "Z_median": -2_051_750_000,
-        "Q_best": 3_456_000_000,
-        "rotations_best": 17,
-        "reject_pct_best": 27.8,
-        "F_best": 327_530,
+        "base": {"time": 3600, "Z_best": -54_087_000, "Z_median": -12_774_000, "Q_best": 1_197_000_000, "rotations_best": 21, "reject_pct_best": 3.1},
     },
 }
 
-# 论文中使用的时间与实例映射 (Table 7)
+
 FULL_TEST_TIMES = {
     "Baltic": 300,
     "WAF": 900,
@@ -74,109 +48,187 @@ FULL_TEST_TIMES = {
 }
 
 
-def run_benchmark(instance: str, max_time: int, method: str = "metaheuristic"):
-    """运行单个实例基准测试。"""
-    print(f"\n{'='*70}")
-    print(f" 实例: {instance} | 方法: {method} | 时限: {max_time}s")
-    print(f"{'='*70}")
+def paper_gap_pct(result: SolverResult, reference: Dict) -> float | None:
+    if not reference:
+        return None
+    denom = max(abs(reference["Z_best"]), 1.0)
+    return (result.objective - reference["Z_best"]) / denom * 100.0
 
+
+def run_single(
+    instance: str,
+    max_time: int,
+    method: str = "metaheuristic",
+    scenario: str = "base",
+    backend: str = "auto",
+    seed: int = 0,
+    collect_diagnostics: bool = False,
+) -> SolverResult:
     result = solve_instance(
-        instance, method=method, max_time=max_time, verbose=False
+        instance,
+        method=method,
+        max_time=max_time,
+        verbose=False,
+        solver_backend=backend,
+        random_seed=seed,
+        scenario=scenario,
+        benchmark_mode=True,
+        collect_diagnostics=collect_diagnostics,
     )
 
+    ref = PAPER_BENCHMARKS.get(instance, {}).get(scenario)
+    result.paper_gap_pct = paper_gap_pct(result, ref)
+    return result
+
+
+def baltic_paper_replay_snapshot() -> dict:
+    """Evaluate the bundled Baltic paper solution with the current cost/MCFP stack."""
+    data = load_instance("Baltic", scenario="base")
+    vessels = {v.name: v for v in build_vessels_from_data(data["fleet"])}
+    ports = build_ports_from_data(data["ports_all"])
+    _, dist_min, canal_info = build_distance_dict(load_distances())
+    weeks = 180 / 7.0
+    demands = [
+        (row["Origin"], row["Destination"], float(row["FFEPerWeek"]) * weeks, float(row["Revenue_1"]))
+        for _, row in data["demand"].iterrows()
+    ]
+    return evaluate_baltic_base_replay(
+        vessels_by_name=vessels,
+        ports_dict=ports,
+        demands=demands,
+        dist_min=dist_min,
+        canal_info=canal_info,
+        cost_config=CostConfig(),
+        solver_backend="auto",
+    )
+
+
+def print_single(result: SolverResult):
     bd = result.cost_breakdown
     fs = result.flow_summary
-    total_demand = fs.get("total_demand_ffe", 0)
-    rejected = fs.get("rejected_ffe", 0)
-    reject_pct = (rejected / total_demand * 100) if total_demand > 0 else 0
+    total_demand = fs.get("total_demand_ffe", 0.0)
+    rejected = fs.get("rejected_ffe", 0.0)
+    reject_pct = rejected / total_demand * 100 if total_demand else 0.0
+    ref = PAPER_BENCHMARKS.get(result.instance_name, {}).get(result.scenario)
 
-    print(f"\n  状态: {result.status}")
+    print(f"\n{'=' * 78}")
+    print(
+        f" 实例: {result.instance_name} | 场景: {result.scenario} | 方法: {result.method}"
+        f" | 后端: {result.solver_backend} | seed: {result.seed}"
+    )
+    print(f"{'=' * 78}")
+    print(f"  状态: {result.status}")
     print(f"  求解时间: {result.solve_time:.1f}s")
     print(f"  迭代次数: {result.iterations}")
-    print(f"\n  === 成本分解 (对应论文 Table 9) ===")
-    print(f"  {'指标':<8} {'本次结果':>15} {'单位'}")
-    print(f"  {'─'*40}")
-    print(f"  {'Z':.<8} {bd.Z:>15,.0f}  USD")
-    print(f"  {'Q':.<8} {bd.Q:>15,.0f}  USD (收入)")
-    print(f"  {'c_v':.<8} {bd.c_v:>15,.0f}  USD (TC)")
-    print(f"  {'c_b':.<8} {bd.c_b:>15,.0f}  USD (燃油)")
-    print(f"  {'c_p':.<8} {bd.c_p:>15,.0f}  USD (港口)")
-    print(f"  {'c_c':.<8} {bd.c_c:>15,.0f}  USD (运河)")
-    print(f"  {'c_m':.<8} {bd.c_m:>15,.0f}  USD (装卸)")
-    print(f"  {'c_t':.<8} {bd.c_t:>15,.0f}  USD (转运)")
-    print(f"  {'L_v':.<8} {bd.L_v:>15,.0f}  USD (租出)")
-    print(f"  {'F':.<8} {bd.F:>15,.0f}  FFE (拒运)")
+    print(f"  候选列: {result.columns_evaluated} | 唯一列: {result.unique_columns} | MCF评估: {result.mcf_evaluations}")
+    print(f"  接受列: {result.accepted_columns} | same-class swaps: {result.same_class_swap_count} | backtracks: {result.backtrack_count}")
+    if result.diagnostics_path:
+        print(f"  诊断文件: {result.diagnostics_path}")
+
+    print(f"\n  === 成本分解 (论文 Table 9 对齐) ===")
+    print(f"  Z={bd.Z:,.0f}  Q={bd.Q:,.0f}  c_v={bd.c_v:,.0f}  c_b={bd.c_b:,.0f}")
+    print(f"  c_p={bd.c_p:,.0f}  c_c={bd.c_c:,.0f}  c_m={bd.c_m:,.0f}  c_t={bd.c_t:,.0f}")
+    print(f"  L_v={bd.L_v:,.0f}  F={bd.F:,.0f}")
 
     print(f"\n  === 网络指标 ===")
     print(f"  航线数 |R|: {len(result.rotations)}")
     print(f"  服务率: {fs.get('service_rate', 0):.1%}")
     print(f"  拒绝率: {reject_pct:.1f}%")
-    print(f"  总需求: {total_demand:,.0f} FFE/week")
+    print(f"  总需求(规划期): {total_demand:,.0f} FFE")
 
-    # 航线详情
-    if result.rotation_details:
-        print(f"\n  === 航线详情 ===")
-        for rd in result.rotation_details:
-            ports_str = " → ".join(rd["port_calls"])
-            print(f"  {rd['id']}: {rd['vessel_class']}, {rd['speed']}kn, "
-                  f"{rd['num_vessels']}v, {rd['round_trip_days']}d "
-                  f"({rd['frequency']})")
-            print(f"    路径: {ports_str}")
-
-    # 与论文对比
-    ref = PAPER_BENCHMARKS.get(instance)
     if ref:
         print(f"\n  === 与论文对比 ===")
-        print(f"  {'指标':<15} {'本次':>12} {'论文 Best':>12} {'论文 Median':>12}")
-        print(f"  {'─'*55}")
-        print(f"  {'Z':<15} {bd.Z:>12,.0f} {ref['Z_best']:>12,.0f} {ref['Z_median']:>12,.0f}")
-        print(f"  {'|R|':<15} {len(result.rotations):>12} {ref['rotations_best']:>12}")
-        print(f"  {'拒绝率%':<13} {reject_pct:>12.1f} {ref['reject_pct_best']:>12.1f}")
+        print(f"  论文 best Z: {ref['Z_best']:,.0f}")
+        print(f"  论文 median Z: {ref['Z_median']:,.0f}")
+        print(f"  论文 best |R|: {ref['rotations_best']}")
+        print(f"  论文 best 拒绝率: {ref['reject_pct_best']:.1f}%")
+        if "source" in ref:
+            print(f"  论文参考来源: {ref['source']}")
+        if result.paper_gap_pct is not None:
+            print(f"  相对论文 best 目标差距: {result.paper_gap_pct:.1f}%")
+        if result.instance_name == "Baltic" and result.scenario == "base":
+            replay = baltic_paper_replay_snapshot()
+            print(f"\n  === 当前模型下的论文服务回放 ===")
+            print(f"  replay objective: {replay['objective']:,.0f}")
+            print(f"  replay service rate: {replay['service_rate']:.1%}")
+            print(f"  replay rejected: {replay['rejected_ffe']:,.0f} FFE")
 
-        # 简单评估
-        if bd.Z <= ref["Z_median"]:
-            verdict = "优于或接近论文中位数"
-        elif bd.Z <= ref["Z_median"] * 1.5:
-            verdict = "在合理范围内"
-        else:
-            verdict = "偏差较大，建议增加时间或检查参数"
-        print(f"\n  评估: {verdict}")
 
-    return result
+def print_summary(results: List[SolverResult], instance: str, scenario: str):
+    objectives = [r.objective for r in results]
+    reject_pcts = [
+        (r.flow_summary.get("rejected_ffe", 0.0) / max(r.flow_summary.get("total_demand_ffe", 1.0), 1.0)) * 100.0
+        for r in results
+    ]
+    ref = PAPER_BENCHMARKS.get(instance, {}).get(scenario)
+    sorted_by_obj = sorted(results, key=lambda r: r.objective)
+    median_result = sorted_by_obj[len(sorted_by_obj) // 2]
+
+    print(f"\n{'=' * 78}")
+    print(f" 汇总: {instance} / {scenario} / {len(results)} runs")
+    print(f"{'=' * 78}")
+    print(f"  最佳目标: {min(objectives):,.0f}")
+    print(f"  中位目标: {statistics.median(objectives):,.0f}")
+    print(f"  平均目标: {statistics.mean(objectives):,.0f}")
+    print(f"  中位拒绝率: {statistics.median(reject_pcts):.1f}%")
+    print(f"  最佳航线数: {len(sorted_by_obj[0].rotations)}")
+    print(f"  中位航线数: {len(median_result.rotations)}")
+    print(f"  最佳后端: {sorted_by_obj[0].solver_backend}")
+    print(f"  中位候选列: {median_result.columns_evaluated} | 唯一列: {median_result.unique_columns} | MCF评估: {median_result.mcf_evaluations}")
+    print(f"  中位接受列: {median_result.accepted_columns} | same-class swaps: {median_result.same_class_swap_count} | backtracks: {median_result.backtrack_count}")
+    if ref:
+        best_gap = paper_gap_pct(sorted_by_obj[0], ref)
+        med_gap = paper_gap_pct(median_result, ref)
+        print(f"  与论文 best 差距(best run): {best_gap:.1f}%")
+        print(f"  与论文 best 差距(median run): {med_gap:.1f}%")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LSND 基准验证脚本")
-    parser.add_argument("--quick", action="store_true",
-                        help="快速测试: Baltic 120s")
-    parser.add_argument("--full", action="store_true",
-                        help="完整测试: 所有实例，论文推荐时间")
-    parser.add_argument("--instance", type=str, default=None,
-                        help="指定实例名称")
-    parser.add_argument("--time", type=int, default=120,
-                        help="最大求解时间 (秒)")
-    parser.add_argument("--method", type=str, default="metaheuristic",
-                        choices=["metaheuristic", "mip"],
-                        help="求解方法")
+    parser = argparse.ArgumentParser(description="LSND benchmark runner")
+    parser.add_argument("--quick", action="store_true", help="Run Baltic/base for 120s")
+    parser.add_argument("--full", action="store_true", help="Run all default instances with paper time limits")
+    parser.add_argument("--instance", type=str, default=None, help="Instance name")
+    parser.add_argument("--time", type=int, default=120, help="Time limit in seconds")
+    parser.add_argument("--method", type=str, default="metaheuristic", choices=["metaheuristic", "mip"])
+    parser.add_argument("--scenario", type=str, default="base", choices=["base", "low", "high"])
+    parser.add_argument("--runs", type=int, default=1, help="Number of repeated runs")
+    parser.add_argument("--seed-base", type=int, default=0, help="Base random seed")
+    parser.add_argument("--backend", type=str, default="auto", choices=["auto", "gurobi", "cbc"])
+    parser.add_argument("--diagnostics", action="store_true", help="Write diagnostics JSON files")
     args = parser.parse_args()
 
     start_all = time.time()
 
     if args.quick:
-        run_benchmark("Baltic", max_time=120, method=args.method)
+        results = [run_single("Baltic", 120, method=args.method, scenario="base", backend=args.backend, seed=args.seed_base, collect_diagnostics=args.diagnostics)]
+        print_single(results[0])
     elif args.full:
         for inst, t in FULL_TEST_TIMES.items():
-            run_benchmark(inst, max_time=t, method="metaheuristic")
-    elif args.instance:
-        run_benchmark(args.instance, max_time=args.time, method=args.method)
+            result = run_single(inst, t, method="metaheuristic", scenario="base", backend=args.backend, seed=args.seed_base, collect_diagnostics=args.diagnostics)
+            print_single(result)
     else:
-        # 默认: 快速 Baltic 测试
-        run_benchmark("Baltic", max_time=120, method=args.method)
+        instance = args.instance or "Baltic"
+        results = [
+            run_single(
+                instance,
+                args.time,
+                method=args.method,
+                scenario=args.scenario,
+                backend=args.backend,
+                seed=args.seed_base + run_idx,
+                collect_diagnostics=args.diagnostics,
+            )
+            for run_idx in range(args.runs)
+        ]
+        for result in results:
+            print_single(result)
+        if len(results) > 1:
+            print_summary(results, instance, args.scenario)
 
     total = time.time() - start_all
-    print(f"\n{'='*70}")
-    print(f" 总耗时: {total:.1f}s ({total/60:.1f} 分钟)")
-    print(f"{'='*70}")
+    print(f"\n{'=' * 78}")
+    print(f" 总耗时: {total:.1f}s ({total / 60:.1f} 分钟)")
+    print(f"{'=' * 78}")
 
 
 if __name__ == "__main__":

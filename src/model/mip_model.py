@@ -19,6 +19,7 @@ from src.utils.cost_calculator import (
     build_distance_dict,
 )
 from src.utils.network_builder import Rotation
+from src.utils.solver_backend import SolverBackend, build_pulp_solver
 
 
 @dataclass
@@ -46,6 +47,7 @@ class MIPResult:
     flow_on_edges: Dict                      # 边流量
     rejected_demand: Dict[Tuple[str, str], float]  # (o,d) -> rejected FFE
     transported_demand: Dict[Tuple[str, str], float]  # (o,d) -> transported FFE
+    active_backend: str = "cbc"
 
 
 class LsndpMIP:
@@ -69,6 +71,7 @@ class LsndpMIP:
         dist_min: Dict[Tuple[str, str], float],
         canal_info: Dict[Tuple[str, str], Tuple[bool, bool]],
         config: CostConfig = None,
+        solver_backend: SolverBackend = "auto",
     ):
         self.rotations = rotations
         self.vessels = {v.name: v for v in vessels}
@@ -78,6 +81,7 @@ class LsndpMIP:
         self.canal_info = canal_info
         self.config = config or CostConfig()
         self.cost_calc = CostCalculator(self.config)
+        self.solver_backend = solver_backend
         self.model = None
         self.result = None
 
@@ -362,7 +366,11 @@ class LsndpMIP:
         if self.model is None:
             self.build()
 
-        solver = pulp.COIN_CMD(path="/opt/homebrew/bin/cbc", timeLimit=time_limit, msg=msg)
+        solver, selection = build_pulp_solver(
+            requested=self.solver_backend,
+            time_limit=time_limit,
+            msg=msg,
+        )
         self.model.solve(solver)
 
         status = pulp.LpStatus[self.model.status]
@@ -398,6 +406,7 @@ class LsndpMIP:
             flow_on_edges=flow,
             rejected_demand=rejected,
             transported_demand=transported,
+            active_backend=selection.active,
         )
         self.result = result
         return result

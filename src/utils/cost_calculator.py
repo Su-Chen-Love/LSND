@@ -311,7 +311,9 @@ def build_distance_dict(dist_df: pd.DataFrame) -> Tuple[
 
 
 def get_distance_for_vessel(dist_full: dict, from_port: str, to_port: str,
-                            vessel_draft: float) -> Tuple[float, bool, bool]:
+                            vessel_draft: float,
+                            canal_info: Dict[Tuple[str, str], Tuple[bool, bool]] = None,
+                            ) -> Tuple[float, bool, bool]:
     """
     获取特定船型（受吃水限制）从 from_port 到 to_port 的最短距离。
     返回 (distance, is_panama, is_suez)。
@@ -325,9 +327,6 @@ def get_distance_for_vessel(dist_full: dict, from_port: str, to_port: str,
             if draft >= vessel_draft or draft == float("inf"):
                 if dist < best_dist:
                     best_dist = dist
-                    # 查找对应的运河信息
-                    best_panama = False
-                    best_suez = False
 
     # 如果使用 dist_full 找不到，退化到无吃水限制
     if best_dist == float("inf"):
@@ -335,5 +334,9 @@ def get_distance_for_vessel(dist_full: dict, from_port: str, to_port: str,
             if fp == from_port and tp == to_port:
                 if dist < best_dist:
                     best_dist = dist
+
+    # 从 canal_info 查找运河信息（基于最短路径的预计算结果）
+    if canal_info and (from_port, to_port) in canal_info:
+        best_panama, best_suez = canal_info[(from_port, to_port)]
 
     return best_dist, best_panama, best_suez

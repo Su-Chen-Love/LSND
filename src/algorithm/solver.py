@@ -6,8 +6,10 @@
 
 import time
 import logging
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
+import json
 
 import pandas as pd
 
@@ -17,10 +19,12 @@ from src.utils.cost_calculator import (
     build_vessels_from_data, build_ports_from_data,
     build_distance_dict,
 )
+from src.utils.solver_backend import SolverBackend
 from src.utils.network_builder import Rotation
 from src.model.mip_model import LsndpMIP, MIPResult, CostBreakdown
 from src.model.mcfp import MCFPSolver
 from src.model.route_generation import RouteGenerator, AUXConfig
+from src.paper_replay import evaluate_baltic_base_replay
 from src.algorithm.metaheuristic import (
     LsndMetaheuristic, MetaheuristicConfig, MetaheuristicResult,
 )
@@ -38,9 +42,14 @@ class SolverConfig:
     reject_penalty: float = 1000.0     # USD/FFE
     port_stay_hours: float = 24.0      # hours
     max_time: int = 300                # seconds
-    max_iterations: int = 50           # for metaheuristic
+    max_iterations: int = 300           # for metaheuristic
     mip_time_limit: int = 300          # for MIP direct solve
     verbose: bool = True
+    solver_backend: SolverBackend = "auto"
+    random_seed: int = 0
+    scenario: str = "base"
+    benchmark_mode: bool = False
+    collect_diagnostics: bool = False
 
 
 @dataclass
@@ -58,6 +67,17 @@ class SolverResult:
     fleet_usage: Dict[str, dict]       # 船型使用情况
     solve_time: float
     iterations: int
+    solver_backend: str = "cbc"
+    seed: int = 0
+    scenario: str = "base"
+    columns_evaluated: int = 0
+    unique_columns: int = 0
+    mcf_evaluations: int = 0
+    accepted_columns: int = 0
+    same_class_swap_count: int = 0
+    backtrack_count: int = 0
+    paper_gap_pct: Optional[float] = None
+    diagnostics_path: Optional[str] = None
 
 
 class LsndSolver:
@@ -81,7 +101,7 @@ class LsndSolver:
         self.progress_callback = progress_callback
 
         # 加载数据
-        data = load_instance(instance_name)
+        data = load_instance(instance_name, scenario=self.config.scenario)
         self.data = data
 
         # 构建数据结构
@@ -109,6 +129,13 @@ class LsndSolver:
             port_stay_hours=self.config.port_stay_hours,
         )
 
+    def _diagnostics_path(self) -> Optional[Path]:
+        if not self.config.collect_diagnostics:
+            return None
+        diagnostics_dir = Path("results") / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        return diagnostics_dir / f"{self.instance_name}_{self.config.scenario}_{self.config.random_seed}.json"
+
     def _load_distances(self):
         from src.data_reader import load_distances
         return load_distances()
@@ -130,6 +157,9 @@ class LsndSolver:
             max_time=self.config.max_time,
             max_iterations=self.config.max_iterations,
             progress_callback=self.progress_callback,
+            random_seed=self.config.random_seed,
+            solver_backend=self.config.solver_backend,
+            collect_diagnostics=self.config.collect_diagnostics,
         )
         tabu_config = TabuConfig()
 
@@ -147,7 +177,7 @@ class LsndSolver:
         result = solver.solve()
 
         # 构建结果
-        return self._build_result(
+        solver_result = self._build_result(
             method="metaheuristic",
             status="Optimal" if result.best_objective < float("inf") else "No solution",
             objective=result.best_objective,
@@ -155,7 +185,16 @@ class LsndSolver:
             mcfp_result=result.mcfp_result,
             solve_time=result.total_time,
             iterations=result.total_iterations,
+            solver_backend=result.active_backend,
+            columns_evaluated=result.total_columns_evaluated,
+            unique_columns=result.unique_columns,
+            mcf_evaluations=result.mcf_evaluations,
+            accepted_columns=result.accepted_columns,
+            same_class_swap_count=result.same_class_swap_count,
+            backtrack_count=result.backtrack_count,
         )
+        self._write_diagnostics(solver_result)
+        return solver_result
 
     def _solve_mip_with_generated_routes(self) -> SolverResult:
         """
@@ -177,10 +216,14 @@ class LsndSolver:
         for v in self.vessels:
             port_objs = [self.ports_dict[p] for p in all_ports if p in self.ports_dict]
 
+            time_per_v = (self.config.max_time * 0.5) / max(1, len(self.vessels))
+            v_start = time.time()
+
             aux_cfg = AUXConfig(
                 max_ports=min(len(all_ports), 20),
                 suppress_subtour=True,
-                time_limit=min(60, self.config.max_time // 10),
+                time_limit=max(5, int(time_per_v / 10)),
+                solver_backend=self.config.solver_backend,
             )
 
             generator = RouteGenerator(
@@ -207,11 +250,11 @@ class LsndSolver:
                     if rot:
                         candidates.append(rot)
 
-                    if time.time() - start > self.config.max_time * 0.5:
+                    if time.time() - v_start > time_per_v:
                         break
-                if time.time() - start > self.config.max_time * 0.5:
+                if time.time() - v_start > time_per_v:
                     break
-            if time.time() - start > self.config.max_time * 0.5:
+            if time.time() - start > self.config.max_time * 0.7:
                 break
 
         logger.info(f"Generated {len(candidates)} candidate rotations")
@@ -241,6 +284,7 @@ class LsndSolver:
             dist_min=self.dist_min,
             canal_info=self.canal_info,
             config=self.cost_config,
+            solver_backend=self.config.solver_backend,
         )
         mip.build()
         mip_result = mip.solve(
@@ -254,7 +298,7 @@ class LsndSolver:
             if mip_result.vessel_assignments.get(rot.id, 0) > 0
         ]
 
-        return self._build_result(
+        solver_result = self._build_result(
             method="mip",
             status=mip_result.status,
             objective=mip_result.objective,
@@ -262,11 +306,21 @@ class LsndSolver:
             mip_result=mip_result,
             solve_time=time.time() - start,
             iterations=1,
+            solver_backend=mip_result.active_backend,
         )
+        self._write_diagnostics(solver_result)
+        return solver_result
 
     def _build_result(self, method, status, objective, rotations,
                       mcfp_result=None, mip_result=None,
-                      solve_time=0.0, iterations=0) -> SolverResult:
+                      solve_time=0.0, iterations=0,
+                      solver_backend="cbc",
+                      columns_evaluated=0,
+                      unique_columns=0,
+                      mcf_evaluations=0,
+                      accepted_columns=0,
+                      same_class_swap_count=0,
+                      backtrack_count=0) -> SolverResult:
         """构建统一的 SolverResult。"""
         cost_calc = CostCalculator(self.cost_config)
 
@@ -332,6 +386,8 @@ class LsndSolver:
             "n_rotations": len(rotations),
         }
 
+        diagnostics_path = self._diagnostics_path()
+
         return SolverResult(
             instance_name=self.instance_name,
             method=method,
@@ -345,6 +401,16 @@ class LsndSolver:
             fleet_usage=vessel_used,
             solve_time=solve_time,
             iterations=iterations,
+            solver_backend=solver_backend,
+            seed=self.config.random_seed,
+            scenario=self.config.scenario,
+            columns_evaluated=columns_evaluated,
+            unique_columns=unique_columns,
+            mcf_evaluations=mcf_evaluations,
+            accepted_columns=accepted_columns,
+            same_class_swap_count=same_class_swap_count,
+            backtrack_count=backtrack_count,
+            diagnostics_path=str(diagnostics_path) if diagnostics_path else None,
         )
 
     def _approximate_breakdown(self, rotations, mcfp_result) -> CostBreakdown:
@@ -395,6 +461,54 @@ class LsndSolver:
 
         return bd
 
+    def _write_diagnostics(self, result: SolverResult) -> None:
+        diagnostics_path = self._diagnostics_path()
+        if diagnostics_path is None:
+            return
+
+        payload = {
+            "instance": result.instance_name,
+            "scenario": result.scenario,
+            "seed": result.seed,
+            "method": result.method,
+            "status": result.status,
+            "objective": result.objective,
+            "solver_backend": result.solver_backend,
+            "solve_time": result.solve_time,
+            "iterations": result.iterations,
+            "columns_evaluated": result.columns_evaluated,
+            "unique_columns": result.unique_columns,
+            "mcf_evaluations": result.mcf_evaluations,
+            "accepted_columns": result.accepted_columns,
+            "same_class_swap_count": result.same_class_swap_count,
+            "backtrack_count": result.backtrack_count,
+            "flow_summary": result.flow_summary,
+            "cost_breakdown": result.cost_breakdown.__dict__,
+            "rotations": result.rotation_details,
+            "selected_rotation_signatures": [
+                {
+                    "vessel_class": rot.vessel_class.name,
+                    "speed": round(rot.speed, 4),
+                    "num_vessels": rot.num_vessels,
+                    "port_calls": list(rot.port_calls),
+                    "butterfly_port": rot.butterfly_port,
+                }
+                for rot in result.rotations
+            ],
+        }
+        if result.instance_name == "Baltic" and result.scenario == "base":
+            vessels_by_name = {v.name: v for v in self.vessels}
+            payload["paper_replay_comparison"] = evaluate_baltic_base_replay(
+                vessels_by_name=vessels_by_name,
+                ports_dict=self.ports_dict,
+                demands=self.demands,
+                dist_min=self.dist_min,
+                canal_info=self.canal_info,
+                cost_config=self.cost_config,
+                solver_backend=self.config.solver_backend,
+            )
+        diagnostics_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
 
 def solve_instance(
     instance_name: str,
@@ -402,6 +516,11 @@ def solve_instance(
     max_time: int = 300,
     fuel_price: float = 600.0,
     verbose: bool = True,
+    solver_backend: SolverBackend = "auto",
+    random_seed: int = 0,
+    scenario: str = "base",
+    benchmark_mode: bool = False,
+    collect_diagnostics: bool = False,
 ) -> SolverResult:
     """
     便捷函数: 求解一个 LINERLIB 实例。
@@ -416,6 +535,11 @@ def solve_instance(
         fuel_price=fuel_price,
         max_time=max_time,
         verbose=verbose,
+        solver_backend=solver_backend,
+        random_seed=random_seed,
+        scenario=scenario,
+        benchmark_mode=benchmark_mode,
+        collect_diagnostics=collect_diagnostics,
     )
     solver = LsndSolver(instance_name, config)
     return solver.solve()

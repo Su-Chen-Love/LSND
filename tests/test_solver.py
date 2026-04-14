@@ -56,6 +56,23 @@ def test_data_structures():
     print(f"  [OK] Baltic: {len(vessels)} 船型, {len(ports)} 港口, {len(dist_min)} 距离对")
 
 
+def test_scenario_scaling():
+    """测试 Low/Base/High 场景缩放规则。"""
+    from src.data_reader import load_instance
+
+    base = load_instance("Baltic", scenario="base")["fleet"]
+    low = load_instance("Baltic", scenario="low")["fleet"]
+    high = load_instance("Baltic", scenario="high")["fleet"]
+
+    assert list(base["Quantity"]) == [4, 2]
+    assert list(low["Quantity"]) == [3, 2], f"low quantity mismatch: {list(low['Quantity'])}"
+    assert list(high["Quantity"]) == [5, 2], f"high quantity mismatch: {list(high['Quantity'])}"
+    assert low["TC rate daily (fixed Cost)"].ge(base["TC rate daily (fixed Cost)"]).all()
+    assert high["TC rate daily (fixed Cost)"].le(base["TC rate daily (fixed Cost)"]).all()
+
+    print("  [OK] 场景缩放规则正确")
+
+
 def test_rotation():
     """测试航线数据结构。"""
     from src.utils.cost_calculator import VesselClass
@@ -79,20 +96,171 @@ def test_rotation():
     print("  [OK] Rotation 数据结构正确")
 
 
+def test_mcfp_small_fixture():
+    """测试图式 MCFP 在简单单航线网络上的流量守恒。"""
+    from src.model.mcfp import MCFPSolver
+    from src.utils.cost_calculator import VesselClass, Port, CostConfig
+    from src.utils.network_builder import Rotation
+
+    vessel = VesselClass(
+        name="Fixture", capacity=100, tc_rate=5000, draft=8.0,
+        min_speed=10, max_speed=14, design_speed=12.0,
+        fuel_design=18.8, fuel_idle=2.4,
+        panama_fee=0, suez_fee=0, quantity=2,
+    )
+    ports = {
+        "A": Port("A", "A", 0.0, 0.0, 10.0, 10.0, 20.0, 100.0, 0.0),
+        "B": Port("B", "B", 1.0, 1.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+    }
+    rotation = Rotation(id="r1", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "B"])
+    solver = MCFPSolver(
+        rotations=[rotation],
+        ports_dict=ports,
+        demands=[("A", "B", 50.0, 100.0)],
+        dist_min={("A", "B"): 100.0, ("B", "A"): 100.0},
+        config=CostConfig(planning_horizon=180, reject_penalty=1000.0),
+    )
+    result = solver.solve(time_limit=30)
+
+    assert result.status == "Optimal", result.status
+    assert abs(result.rejected[("A", "B")]) < 1e-6
+    assert result.total_revenue == 5000.0
+    assert abs(result.total_handling_cost - (10.0 + 15.0) * 50.0) < 1e-3
+    assert result.flow["r1"][("A", "B")] > 0
+
+    print("  [OK] 简单 MCFP 夹具验证通过")
+
+
+def test_baltic_paper_replay():
+    """论文 Baltic Base 服务回放应保持接近论文日志。"""
+    from src.data_reader import load_instance, load_distances
+    from src.paper_replay import evaluate_baltic_base_replay
+    from src.utils.cost_calculator import build_vessels_from_data, build_ports_from_data, build_distance_dict, CostConfig
+
+    data = load_instance("Baltic", scenario="base")
+    vessels = {v.name: v for v in build_vessels_from_data(data["fleet"])}
+    ports = build_ports_from_data(data["ports_all"])
+    _, dist_min, canal_info = build_distance_dict(load_distances())
+    weeks = 180 / 7.0
+    demands = [
+        (row["Origin"], row["Destination"], float(row["FFEPerWeek"]) * weeks, float(row["Revenue_1"]))
+        for _, row in data["demand"].iterrows()
+    ]
+
+    replay = evaluate_baltic_base_replay(
+        vessels_by_name=vessels,
+        ports_dict=ports,
+        demands=demands,
+        dist_min=dist_min,
+        canal_info=canal_info,
+        cost_config=CostConfig(),
+    )
+
+    assert replay["status"] == "Optimal"
+    assert replay["service_rate"] >= 0.91, replay["service_rate"]
+    assert replay["objective"] < -5_500_000, replay["objective"]
+    assert replay["rejected_ffe"] < 12_000, replay["rejected_ffe"]
+
+    print("  [OK] 论文 Baltic 服务回放保持有效")
+
+
+def test_aux_butterfly_extraction():
+    """蝴蝶边集应被确定性提取为完整回路。"""
+    from src.model.route_generation import RouteGenerator
+
+    edges = [
+        ("RULED", "FIKTK"),
+        ("FIKTK", "DEBRV"),
+        ("DEBRV", "RUKGD"),
+        ("RUKGD", "PLGDY"),
+        ("PLGDY", "DEBRV"),
+        ("DEBRV", "RULED"),
+    ]
+    extracted = RouteGenerator.extract_route_from_active_edges(edges, fallback_butterfly={"DEBRV"})
+    assert extracted is not None
+    port_calls, butterfly_port = extracted
+    assert butterfly_port == "DEBRV"
+    assert len(port_calls) == len(edges)
+    assert port_calls.count("DEBRV") == 2
+
+    edge_multiset = {}
+    for idx in range(len(port_calls)):
+        i_p = port_calls[idx]
+        j_p = port_calls[(idx + 1) % len(port_calls)]
+        edge_multiset[(i_p, j_p)] = edge_multiset.get((i_p, j_p), 0) + 1
+    for edge in edges:
+        assert edge_multiset.get(edge, 0) == 1, f"missing edge {edge} in {port_calls}"
+
+    print("  [OK] AUX 蝴蝶提取逻辑正确")
+
+
+def test_aux_multiple_candidates():
+    """单个 AUX 子问题应能枚举出多个去重候选。"""
+    from src.data_reader import load_instance, load_distances
+    from src.model.route_generation import AUXConfig, RouteGenerator
+    from src.utils.cost_calculator import CostConfig, build_distance_dict, build_ports_from_data, build_vessels_from_data
+
+    data = load_instance("Baltic", scenario="base")
+    vessels = build_vessels_from_data(data["fleet"])
+    ports_dict = build_ports_from_data(data["ports_all"])
+    _, dist_min, canal_info = build_distance_dict(load_distances())
+    residual = {}
+    revenue = {}
+    weeks = 180 / 7.0
+    for _, row in data["demand"].iterrows():
+        residual[(row["Origin"], row["Destination"])] = float(row["FFEPerWeek"]) * weeks
+        revenue[(row["Origin"], row["Destination"])] = float(row["Revenue_1"])
+
+    from src.model.route_generation import create_port_clusters
+
+    all_ports = sorted(set([o for o, _ in residual] + [d for _, d in residual]))
+    cluster = create_port_clusters(all_ports, residual, dist_min, max_cluster_size=20)[0]
+    generator = RouteGenerator(
+        ports=[ports_dict[p] for p in cluster],
+        port_codes=cluster,
+        vessel=vessels[0],
+        residual_demand=residual,
+        demand_revenue=revenue,
+        dist_min=dist_min,
+        canal_info=canal_info,
+        ports_dict=ports_dict,
+        config=CostConfig(),
+        aux_config=AUXConfig(time_limit=10, num_solutions=3),
+    )
+
+    candidates = generator.solve_many(speed=10.0, num_vessels=1, rotation_prefix="test_aux", limit=5)
+    signatures = {tuple(rot.port_calls) for rot in candidates}
+    assert len(candidates) >= 2, len(candidates)
+    assert len(signatures) == len(candidates)
+
+    print("  [OK] AUX 多候选枚举正常")
+
+
 def test_solver_baltic():
     """测试在 Baltic 实例上的完整求解。"""
     from src.algorithm.solver import solve_instance
 
-    print("  正在求解 Baltic 实例 (60s)...")
-    result = solve_instance("Baltic", method="metaheuristic", max_time=60, verbose=False)
+    print("  正在求解 Baltic 实例 (20s)...")
+    result = solve_instance(
+        "Baltic",
+        method="metaheuristic",
+        max_time=20,
+        verbose=False,
+        random_seed=7,
+        collect_diagnostics=True,
+    )
 
     assert result.status != "Error", f"求解出错: {result.status}"
     assert result.solve_time > 0, "求解时间为 0"
+    assert result.columns_evaluated >= result.unique_columns
+    assert result.diagnostics_path is not None
 
     bd = result.cost_breakdown
     print(f"  Status: {result.status}")
     print(f"  Objective: {result.objective:,.0f}")
     print(f"  Rotations: {len(result.rotations)}")
+    print(f"  Backend: {result.solver_backend}")
+    print(f"  Columns: {result.columns_evaluated}, unique: {result.unique_columns}, MCF eval: {result.mcf_evaluations}")
     print(f"  Service rate: {result.flow_summary.get('service_rate', 0):.1%}")
     print(f"  Z={bd.Z:,.0f}, Q={bd.Q:,.0f}, c_v={bd.c_v:,.0f}, c_b={bd.c_b:,.0f}")
     print(f"  c_p={bd.c_p:,.0f}, c_c={bd.c_c:,.0f}, c_m={bd.c_m:,.0f}, c_t={bd.c_t:,.0f}")
@@ -122,7 +290,12 @@ if __name__ == "__main__":
     tests = [
         ("成本计算公式", test_cost_calculator),
         ("数据结构构建", test_data_structures),
+        ("场景缩放规则", test_scenario_scaling),
         ("Rotation 数据结构", test_rotation),
+        ("MCFP 简单夹具", test_mcfp_small_fixture),
+        ("Baltic 论文回放", test_baltic_paper_replay),
+        ("AUX 蝴蝶提取", test_aux_butterfly_extraction),
+        ("AUX 多候选枚举", test_aux_multiple_candidates),
         ("Baltic 实例求解", test_solver_baltic),
     ]
 

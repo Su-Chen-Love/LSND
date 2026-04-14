@@ -2,3 +2,4 @@ pandas>=2.0
 plotly>=5.0
 streamlit>=1.30
 pulp>=2.7
+watchdog>=4.0

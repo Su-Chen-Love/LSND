@@ -105,16 +105,17 @@ def score_rotations(
     rotations: List[Rotation],
     flow: Dict[str, Dict],
     capacities: Dict[str, float],
+    distances: Dict = None,
 ) -> Dict[str, float]:
     """
     对航线评分 (用于回溯删除决策)。
 
     论文三个标准:
-    1. 空 FFE-miles (高 = 差)
-    2. 低利用率腿 (低利用率 = 差)
-    3. MIP gap (高 = 差, 此处简化为 0)
+    1. 空 FFE-miles (高 = 差) — 航线的空载里程占总里程的比例
+    2. 低利用率腿 (低利用率 = 差) — 利用率低于阈值的腿的比例
+    3. MIP gap (高 = 差) — 近似为航线运营成本与收入的比值
 
-    返回: rotation_id -> score (越高越差)
+    返回: rotation_id -> score (越高越差，越应该被删除)
     """
     scores = {}
     for rot in rotations:
@@ -122,12 +123,19 @@ def score_rotations(
         total_flow = sum(rot_flow.values())
         cap = capacities.get(rot.id, rot.vessel_class.capacity)
 
-        # 利用率
+        # 标准 1: 利用率 (0 = 满载, 1 = 空载)
         utilization = total_flow / max(cap, 1.0)
-
-        # 空 FFE-miles 比例 (简化: 1 - utilization)
         empty_ratio = 1.0 - min(utilization, 1.0)
 
-        scores[rot.id] = empty_ratio
+        # 标准 2: 空 FFE-miles — 航线总里程中未承载货物的比例
+        # 用总流量/容量 × 航线总腿数来近似
+        n_legs = len(rot.port_calls)
+        ffe_miles_score = empty_ratio * n_legs  # 空载里程与腿数成正比
+
+        # 标准 3: 成本效率 — 船数越多但流量越低越差
+        vessel_cost_score = rot.num_vessels / max(total_flow, 1.0) * cap
+
+        # 综合评分: 加权组合 (越高越差)
+        scores[rot.id] = 0.4 * empty_ratio + 0.4 * (ffe_miles_score / max(n_legs, 1)) + 0.2 * min(vessel_cost_score, 1.0)
 
     return scores

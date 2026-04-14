@@ -1,50 +1,53 @@
 """
-多商品流问题 (MCFP) 求解模块 — 实现论文 §6.2 中的货物流量分配。
+Multicommodity flow problem for evaluating a fixed set of rotations.
 
-给定当前航线集合 R_u，求解最优的货物流量分配。
-这是元启发式中每次迭代评估航线网络质量的核心组件。
-
-参考: Brouer et al. (2014), Transportation Science 48(2), pp. 299-300, Figure 7
+This implementation follows the terminal-node + port-call-node graph
+described in Brouer et al. (2014), Figure 7, instead of the earlier
+non-butterfly approximation.
 """
 
-from typing import Dict, List, Tuple, Optional
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import pulp
 
-from src.utils.cost_calculator import VesselClass, Port, CostCalculator, CostConfig
-from src.utils.network_builder import Rotation
+from src.utils.cost_calculator import CostCalculator, CostConfig, Port
+from src.utils.network_builder import Rotation, build_mcf_network
+from src.utils.solver_backend import SolverBackend, build_pulp_solver
 
 
 @dataclass
 class MCFPResult:
-    """MCFP 求解结果。"""
+    """MCFP solve result."""
+
     status: str
-    objective: float                           # 目标函数值 (成本 - 收入)
-    total_revenue: float                       # 总运输收入
-    total_handling_cost: float                 # 总装卸费
-    total_transship_cost: float                # 总转运费
-    total_reject_penalty: float                # 总拒运惩罚
-    flow: Dict[str, Dict[Tuple[str, str], float]]  # rotation -> (o,d) -> flow
-    rejected: Dict[Tuple[str, str], float]     # (o,d) -> rejected FFE
-    residual_demand: Dict[Tuple[str, str], float]  # (o,d) -> residual demand
+    objective: float
+    total_revenue: float
+    total_handling_cost: float
+    total_transship_cost: float
+    total_reject_penalty: float
+    flow: Dict[str, Dict[Tuple[str, str], float]]
+    leg_flow: Dict[str, Dict[Tuple[str, str], float]]
+    rejected: Dict[Tuple[str, str], float]
+    residual_demand: Dict[Tuple[str, str], float]
+    active_backend: str = "cbc"
 
 
 class MCFPSolver:
     """
-    多商品流问题求解器。
-
-    构建论文 Figure 7 描述的图结构并求解 LP。
-    使用 LP 松弛（连续变量）以快速求解。
+    Evaluate a network of rotations by routing demand over the Figure 7 graph.
     """
 
     def __init__(
         self,
         rotations: List[Rotation],
         ports_dict: Dict[str, Port],
-        demands: List[Tuple[str, str, float, float]],  # (o, d, quantity, revenue)
+        demands: List[Tuple[str, str, float, float]],
         dist_min: Dict[Tuple[str, str], float],
         config: CostConfig = None,
+        solver_backend: SolverBackend = "auto",
     ):
         self.rotations = rotations
         self.ports_dict = ports_dict
@@ -52,227 +55,200 @@ class MCFPSolver:
         self.dist_min = dist_min
         self.config = config or CostConfig()
         self.cost_calc = CostCalculator(self.config)
+        self.solver_backend = solver_backend
 
-    def solve(self, vessel_assignments: Optional[Dict[str, int]] = None,
-              time_limit: int = 120) -> MCFPResult:
+    def solve(
+        self,
+        vessel_assignments: Optional[Dict[str, int]] = None,
+        time_limit: int = 120,
+    ) -> MCFPResult:
         """
-        求解多商品流问题。
-
-        参数:
-        - vessel_assignments: 每条航线的船舶分配数 (若 None，使用航线自带值)
-        - time_limit: 求解时限
-
-        返回:
-        - MCFPResult
+        Solve the multicommodity flow LP for a fixed set of rotations.
         """
+        rotations = self._apply_assignments(vessel_assignments)
+        network = build_mcf_network(
+            rotations=rotations,
+            ports_dict=self.ports_dict,
+            demands=self.demands,
+            distances=self.dist_min,
+            cost_calc=self.cost_calc,
+        )
+
         model = pulp.LpProblem("MCFP", pulp.LpMinimize)
-        R = self.rotations
-        G = self.demands
 
-        # 预计算航线容量
-        rot_caps = {}
-        for rot in R:
-            n_vessels = vessel_assignments.get(rot.id, rot.num_vessels) if vessel_assignments else rot.num_vessels
-            round_trip_days = self.cost_calc.rotation_round_trip_time(
-                rot.vessel_class, rot.speed, rot.port_calls, self.dist_min
-            )
-            m_r = self.cost_calc.num_round_trips(round_trip_days)
-            rot_caps[rot.id] = {
-                "n_vessels": n_vessels,
-                "m_r": m_r,
-                "capacity_per_leg": rot.vessel_class.capacity * m_r * n_vessels,
-            }
+        sail_edges = [e for e in network.edges if e.edge_type == "sail"]
+        transship_edges = [e for e in network.edges if e.edge_type == "transship"]
+        load_edges = [e for e in network.edges if e.edge_type == "load"]
+        unload_edges = [e for e in network.edges if e.edge_type == "unload"]
+        omit_edges = {e.edge_id: e for e in network.edges if e.edge_type == "omit"}
 
-        # ========== 变量 ==========
+        revenue_by_od = {(o, d): q for o, d, _, q in self.demands}
+        quantity_by_od = {(o, d): k for o, d, k, _ in self.demands}
 
-        # V_r_od: 在航线 r 起点 o 处首次装载的 (o,d) 需求
-        V = {}
-        for rot in R:
-            for o, d, _, _ in G:
-                if o in rot.port_calls:
-                    V[(rot.id, o, d)] = pulp.LpVariable(
-                        f"V_{rot.id}_{o}_{d}", lowBound=0
-                    )
-
-        # X_r(ij)d: 航线 r 边 (i,j) 上运往 d 的流量
+        # Edge variables by commodity.
         X = {}
-        for rot in R:
-            for i, j in rot.edges:
-                for _, d, _, _ in G:
-                    X[(rot.id, i, j, d)] = pulp.LpVariable(
-                        f"X_{rot.id}_{i}_{j}_{d}", lowBound=0
-                    )
-
-        # U_rs(port, d): 在港口 port 从航线 r 转运到航线 s 的 d 方向流量
         U = {}
-        for r_rot in R:
-            for s_rot in R:
-                if r_rot.id == s_rot.id:
-                    continue
-                common = set(r_rot.port_calls) & set(s_rot.port_calls)
-                for port in common:
-                    for _, d, _, _ in G:
-                        if d != port:
-                            U[(r_rot.id, s_rot.id, port, d)] = pulp.LpVariable(
-                                f"U_{r_rot.id}_{s_rot.id}_{port}_{d}", lowBound=0
-                            )
-
-        # O_od: 拒运量
+        V = {}
+        W = {}
         O = {}
-        for o, d, _, _ in G:
-            O[(o, d)] = pulp.LpVariable(f"O_{o}_{d}", lowBound=0)
 
-        # ========== 目标函数 ==========
-        # 最小化: 拒运惩罚 - 运输收入 + 装卸费 + 转运费
-        # (航线固定运营成本在外部计算，MCFP 只优化流量)
+        node_incoming: Dict[Tuple[str, str, str], List[pulp.LpVariable]] = {}
+        node_outgoing: Dict[Tuple[str, str, str], List[pulp.LpVariable]] = {}
+
         obj = pulp.LpAffineExpression()
 
-        for o, d, k_od, q_od in G:
-            # 拒运惩罚
-            obj += self.config.reject_penalty * O[(o, d)]
-            # 运输收入 (负值, 因为最小化)
-            for rot in R:
-                if (rot.id, o, d) in V:
-                    obj -= q_od * V[(rot.id, o, d)]
-            # 装卸费
-            port_o = self.ports_dict.get(o)
-            port_d = self.ports_dict.get(d)
-            for rot in R:
-                if (rot.id, o, d) in V:
-                    if port_o:
-                        obj += port_o.move_cost * V[(rot.id, o, d)]
-                    # 卸货费在目的地 (通过到达 d 的流量计算)
+        for o, d, _, _ in self.demands:
+            source = network.terminal_nodes[o]
+            sink = network.terminal_nodes[d]
 
-        # 卸货费
-        for rot in R:
-            for i, j in rot.edges:
-                port = self.ports_dict.get(j)
-                if port:
-                    # X_r(ij)j 是到达目的地 j 的流量
-                    if (rot.id, i, j, j) in X:
-                        obj += port.move_cost * X[(rot.id, i, j, j)]
+            # Load edges are only available from the commodity origin terminal.
+            for edge in load_edges:
+                if edge.source != source:
+                    continue
+                var = pulp.LpVariable(f"V_{edge.edge_id}_{o}_{d}", lowBound=0)
+                V[(edge.edge_id, o, d)] = var
+                obj += (edge.cost - revenue_by_od[(o, d)]) * var
+                self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
 
-        # 转运费
-        for key, u_var in U.items():
-            _, _, port_code, _ = key
-            port = self.ports_dict.get(port_code)
-            if port:
-                obj += port.transship_cost * u_var
+            # Sailing edges are commodity-specific across all call nodes.
+            for edge in sail_edges:
+                var = pulp.LpVariable(f"X_{edge.edge_id}_{o}_{d}", lowBound=0)
+                X[(edge.edge_id, o, d)] = var
+                self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
+
+            # Transshipment edges are commodity-specific as well.
+            for edge in transship_edges:
+                var = pulp.LpVariable(f"U_{edge.edge_id}_{o}_{d}", lowBound=0)
+                U[(edge.edge_id, o, d)] = var
+                obj += edge.cost * var
+                self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
+
+            # Unload edges are only available into the commodity destination terminal.
+            for edge in unload_edges:
+                if edge.target != sink:
+                    continue
+                var = pulp.LpVariable(f"W_{edge.edge_id}_{o}_{d}", lowBound=0)
+                W[(edge.edge_id, o, d)] = var
+                obj += edge.cost * var
+                self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
+
+            omit_edge = omit_edges[f"omit:{o}:{d}"]
+            omit_var = pulp.LpVariable(f"O_{o}_{d}", lowBound=0, upBound=quantity_by_od[(o, d)])
+            O[(o, d)] = omit_var
+            obj += omit_edge.cost * omit_var
+            self._append_arc(node_outgoing, node_incoming, omit_edge.source, omit_edge.target, o, d, omit_var)
+
+            # Source and sink balance. Source pushes the full demand into either
+            # the network or the omission arc; sink receives all serviced or
+            # omitted cargo.
+            model += (
+                pulp.lpSum(node_outgoing.get((source, o, d), []))
+                - pulp.lpSum(node_incoming.get((source, o, d), []))
+                == quantity_by_od[(o, d)],
+                f"source_{o}_{d}",
+            )
+            model += (
+                pulp.lpSum(node_incoming.get((sink, o, d), []))
+                - pulp.lpSum(node_outgoing.get((sink, o, d), []))
+                == quantity_by_od[(o, d)],
+                f"sink_{o}_{d}",
+            )
 
         model += obj, "MCFP_objective"
 
-        # ========== 约束 ==========
+        # Flow conservation on all call nodes for every commodity.
+        for node in network.nodes:
+            if not node.startswith("call:"):
+                continue
+            for o, d, _, _ in self.demands:
+                inflow = pulp.lpSum(node_incoming.get((node, o, d), []))
+                outflow = pulp.lpSum(node_outgoing.get((node, o, d), []))
+                model += (inflow == outflow, f"flow_{node.replace(':', '_')}_{o}_{d}")
 
-        # 需求满足: O_od + sum_r V_r_od = k_od
-        for o, d, k_od, _ in G:
+        # Capacity constraints across commodities.
+        for edge in sail_edges:
             model += (
-                O[(o, d)] + pulp.lpSum(
-                    V[(rot.id, o, d)] for rot in R if (rot.id, o, d) in V
-                ) == k_od,
-                f"demand_{o}_{d}",
+                pulp.lpSum(X[(edge.edge_id, o, d)] for o, d, _, _ in self.demands) <= edge.capacity,
+                f"cap_sail_{edge.edge_id.replace(':', '_')}",
             )
-
-        # 流量守恒 (简化: 非蝴蝶)
-        # 使用集合去重: 同一 (rot, triple_idx, d) 只需一个约束
-        for rot in R:
-            triples = rot.triples
-            seen_constraints = set()
-            for t_idx, (h, i, j) in enumerate(triples):
-                for _, d, _, _ in G:
-                    if i == d:
-                        continue
-                    ckey = (rot.id, t_idx, d)
-                    if ckey in seen_constraints:
-                        continue
-                    seen_constraints.add(ckey)
-
-                    lhs = pulp.LpAffineExpression()
-                    if (rot.id, h, i, d) in X:
-                        lhs += X[(rot.id, h, i, d)]
-                    if (rot.id, i, d) in V:
-                        lhs += V[(rot.id, i, d)]
-                    for s_rot in R:
-                        if s_rot.id == rot.id:
-                            continue
-                        key = (s_rot.id, rot.id, i, d)
-                        if key in U:
-                            lhs += U[key]
-
-                    rhs = pulp.LpAffineExpression()
-                    if (rot.id, i, j, d) in X:
-                        rhs += X[(rot.id, i, j, d)]
-                    for s_rot in R:
-                        if s_rot.id == rot.id:
-                            continue
-                        key = (rot.id, s_rot.id, i, d)
-                        if key in U:
-                            rhs += U[key]
-
-                    model += (lhs == rhs, f"flow_{rot.id}_t{t_idx}_{d}")
-
-        # 边容量约束
-        for rot in R:
-            cap = rot_caps[rot.id]["capacity_per_leg"]
-            for i, j in rot.edges:
+        for edge in transship_edges:
+            model += (
+                pulp.lpSum(U[(edge.edge_id, o, d)] for o, d, _, _ in self.demands) <= edge.capacity,
+                f"cap_trans_{edge.edge_id.replace(':', '_')}",
+            )
+        for edge in load_edges:
+            relevant = [V[(edge.edge_id, o, d)] for o, d, _, _ in self.demands if (edge.edge_id, o, d) in V]
+            if relevant:
                 model += (
-                    pulp.lpSum(
-                        X[(rot.id, i, j, d)]
-                        for _, d, _, _ in G
-                        if (rot.id, i, j, d) in X
-                    ) <= cap,
-                    f"cap_{rot.id}_{i}_{j}",
+                    pulp.lpSum(relevant) <= edge.capacity,
+                    f"cap_load_{edge.edge_id.replace(':', '_')}",
+                )
+        for edge in unload_edges:
+            relevant = [W[(edge.edge_id, o, d)] for o, d, _, _ in self.demands if (edge.edge_id, o, d) in W]
+            if relevant:
+                model += (
+                    pulp.lpSum(relevant) <= edge.capacity,
+                    f"cap_unload_{edge.edge_id.replace(':', '_')}",
                 )
 
-        # ========== 求解 ==========
-        solver = pulp.COIN_CMD(path="/opt/homebrew/bin/cbc", timeLimit=time_limit, msg=False)
+        solver, selection = build_pulp_solver(
+            requested=self.solver_backend,
+            time_limit=time_limit,
+            msg=False,
+        )
         model.solve(solver)
 
         status = pulp.LpStatus[model.status]
         objective = pulp.value(model.objective) if model.status == 1 else float("inf")
 
-        # 提取结果
         rejected = {}
         residual = {}
-        for o, d, k_od, _ in G:
-            o_val = pulp.value(O[(o, d)]) or 0.0
-            rejected[(o, d)] = o_val
-            residual[(o, d)] = o_val  # 残差需求 = 拒运量
-
         flow = {}
-        for rot in R:
-            rot_flow = {}
-            for o, d, _, _ in G:
-                if (rot.id, o, d) in V:
-                    val = pulp.value(V[(rot.id, o, d)]) or 0.0
-                    if val > 0.001:
-                        rot_flow[(o, d)] = val
-            if rot_flow:
-                flow[rot.id] = rot_flow
-
-        # 统计
+        leg_flow = {}
         total_revenue = 0.0
         total_handling = 0.0
         total_transship = 0.0
         total_penalty = 0.0
 
-        for o, d, k_od, q_od in G:
-            transported = k_od - rejected.get((o, d), 0.0)
-            total_revenue += q_od * transported
-            port_o = self.ports_dict.get(o)
-            port_d = self.ports_dict.get(d)
-            if port_o:
-                total_handling += port_o.move_cost * transported
-            if port_d:
-                total_handling += port_d.move_cost * transported
-            total_penalty += self.config.reject_penalty * rejected.get((o, d), 0.0)
+        for o, d, k_od, q_od in self.demands:
+            rejected_val = pulp.value(O[(o, d)]) or 0.0
+            rejected[(o, d)] = rejected_val
+            residual[(o, d)] = rejected_val
 
-        for key, u_var in U.items():
-            val = pulp.value(u_var) or 0.0
-            if val > 0.001:
-                _, _, port_code, _ = key
-                port = self.ports_dict.get(port_code)
-                if port:
-                    total_transship += port.transship_cost * val
+            transported = k_od - rejected_val
+            total_revenue += q_od * transported
+            total_penalty += self.config.reject_penalty * rejected_val
+
+        # Count load/unload cost using actual chosen flows rather than
+        # reconstructing from transported totals.
+        for (edge_id, o, d), var in V.items():
+            val = pulp.value(var) or 0.0
+            if val <= 0.001:
+                continue
+            edge = next(e for e in load_edges if e.edge_id == edge_id)
+            total_handling += edge.cost * val
+            flow.setdefault(edge.rotation_id, {})[(o, d)] = flow.setdefault(edge.rotation_id, {}).get((o, d), 0.0) + val
+
+        for (edge_id, o, d), var in W.items():
+            val = pulp.value(var) or 0.0
+            if val <= 0.001:
+                continue
+            edge = next(e for e in unload_edges if e.edge_id == edge_id)
+            total_handling += edge.cost * val
+
+        for (edge_id, o, d), var in U.items():
+            val = pulp.value(var) or 0.0
+            if val <= 0.001:
+                continue
+            edge = next(e for e in transship_edges if e.edge_id == edge_id)
+            total_transship += edge.cost * val
+
+        for (edge_id, o, d), var in X.items():
+            val = pulp.value(var) or 0.0
+            if val <= 0.001:
+                continue
+            edge = next(e for e in sail_edges if e.edge_id == edge_id)
+            leg_flow.setdefault(edge.rotation_id, {})[(o, d)] = leg_flow.setdefault(edge.rotation_id, {}).get((o, d), 0.0) + val
 
         return MCFPResult(
             status=status,
@@ -282,6 +258,33 @@ class MCFPSolver:
             total_transship_cost=total_transship,
             total_reject_penalty=total_penalty,
             flow=flow,
+            leg_flow=leg_flow,
             rejected=rejected,
             residual_demand=residual,
+            active_backend=selection.active,
         )
+
+    @staticmethod
+    def _append_arc(store_out, store_in, source: str, target: str, o: str, d: str, var):
+        store_out.setdefault((source, o, d), []).append(var)
+        store_in.setdefault((target, o, d), []).append(var)
+
+    def _apply_assignments(self, vessel_assignments: Optional[Dict[str, int]]) -> List[Rotation]:
+        if not vessel_assignments:
+            return self.rotations
+
+        adjusted = []
+        for rot in self.rotations:
+            assigned = vessel_assignments.get(rot.id, rot.num_vessels)
+            adjusted.append(
+                Rotation(
+                    id=rot.id,
+                    vessel_class=rot.vessel_class,
+                    speed=rot.speed,
+                    num_vessels=assigned,
+                    port_calls=list(rot.port_calls),
+                    is_butterfly=rot.is_butterfly,
+                    butterfly_port=rot.butterfly_port,
+                )
+            )
+        return adjusted

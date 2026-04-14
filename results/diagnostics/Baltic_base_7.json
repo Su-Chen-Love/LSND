@@ -1,0 +1,183 @@
+{
+  "instance": "Baltic",
+  "scenario": "base",
+  "seed": 7,
+  "method": "metaheuristic",
+  "status": "Optimal",
+  "objective": 1831030.0488503575,
+  "solver_backend": "cbc",
+  "solve_time": 20.011748790740967,
+  "iterations": 13,
+  "columns_evaluated": 226,
+  "unique_columns": 100,
+  "mcf_evaluations": 86,
+  "accepted_columns": 3,
+  "same_class_swap_count": 0,
+  "backtrack_count": 2,
+  "flow_summary": {
+    "total_demand_ffe": 126102.85714285714,
+    "transported_ffe": 110416.76606285715,
+    "rejected_ffe": 15686.09108,
+    "service_rate": 0.8756087575222041,
+    "n_rotations": 3
+  },
+  "cost_breakdown": {
+    "Z": 1831029.785564633,
+    "Q": 90865588.7048857,
+    "c_v": 6480000.0,
+    "c_b": 9503199.642236643,
+    "c_p": 9575707.465153709,
+    "c_c": 0.0,
+    "c_m": 51451620.303059995,
+    "c_t": 0.0,
+    "L_v": 0.0,
+    "F": 15686.09108
+  },
+  "rotations": [
+    {
+      "id": "seed_Feeder_800_2_DEBRV_6",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 2,
+      "speed": 14.0,
+      "port_calls": [
+        "DEBRV",
+        "RULED",
+        "SEGOT",
+        "DEBRV",
+        "DKAAR",
+        "FIKTK"
+      ],
+      "round_trip_days": 20.0,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_Feeder_450_3_DEBRV_6",
+      "vessel_class": "Feeder_450",
+      "num_vessels": 3,
+      "speed": 12.0,
+      "port_calls": [
+        "DEBRV",
+        "RULED",
+        "PLGDY",
+        "DEBRV",
+        "RUKGD",
+        "SEGOT"
+      ],
+      "round_trip_days": 20.7,
+      "frequency": "weekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "rot_68_0",
+      "vessel_class": "Feeder_450",
+      "num_vessels": 1,
+      "speed": 12.0,
+      "port_calls": [
+        "DEBRV",
+        "SEGOT",
+        "NOSVG"
+      ],
+      "round_trip_days": 6.4,
+      "frequency": "weekly",
+      "is_butterfly": false
+    }
+  ],
+  "selected_rotation_signatures": [
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 2,
+      "port_calls": [
+        "DEBRV",
+        "RULED",
+        "SEGOT",
+        "DEBRV",
+        "DKAAR",
+        "FIKTK"
+      ],
+      "butterfly_port": "DEBRV"
+    },
+    {
+      "vessel_class": "Feeder_450",
+      "speed": 12.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "DEBRV",
+        "RULED",
+        "PLGDY",
+        "DEBRV",
+        "RUKGD",
+        "SEGOT"
+      ],
+      "butterfly_port": "DEBRV"
+    },
+    {
+      "vessel_class": "Feeder_450",
+      "speed": 12.0,
+      "num_vessels": 1,
+      "port_calls": [
+        "DEBRV",
+        "SEGOT",
+        "NOSVG"
+      ],
+      "butterfly_port": null
+    }
+  ],
+  "paper_replay_comparison": {
+    "source": "data/LinerLib/results/BrouerDesaulniersPisinger2014/Baltic_best_base.log",
+    "status": "Optimal",
+    "objective": -6175233.800943371,
+    "mcf_objective": -30737717.24906,
+    "service_rate": 0.9219004292754214,
+    "rejected_ffe": 9848.57901,
+    "costs": {
+      "Q": 94937138.37398574,
+      "c_m": 54350842.18074,
+      "c_t": 0.0,
+      "penalty": 9848579.010000002
+    },
+    "rotations": [
+      {
+        "id": "paper_0",
+        "vessel_class": "Feeder_450",
+        "num_vessels": 3,
+        "speed": 11.1944,
+        "port_calls": [
+          "RULED",
+          "FIKTK",
+          "DEBRV",
+          "RUKGD",
+          "PLGDY",
+          "DEBRV"
+        ],
+        "is_butterfly": true
+      },
+      {
+        "id": "paper_1",
+        "vessel_class": "Feeder_800",
+        "num_vessels": 2,
+        "speed": 15.4954,
+        "port_calls": [
+          "RULED",
+          "DEBRV",
+          "NOSVG",
+          "SEGOT",
+          "DEBRV"
+        ],
+        "is_butterfly": true
+      },
+      {
+        "id": "paper_2",
+        "vessel_class": "Feeder_450",
+        "num_vessels": 1,
+        "speed": 10.0,
+        "port_calls": [
+          "DEBRV",
+          "DKAAR"
+        ],
+        "is_butterfly": false
+      }
+    ]
+  }
+}

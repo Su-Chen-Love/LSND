@@ -14,6 +14,41 @@ from pathlib import Path
 
 from src.data_reader import load_instance, load_distances, INSTANCES
 
+# 论文 Table 9 参考值 — Low / Base / High 三种场景
+# 单位: USD (论文中为 k$, 此处 ×1000)
+PAPER_BENCHMARKS = {
+    "Baltic": {
+        "Low":  {"Z_best": -6_044_000,  "Z_median": 838_000,    "Q_best": 96_750_000,  "rotations_best": 5, "reject_pct_best": 8.6},
+        "Base": {"Z_best": -8_365_000,  "Z_median": -6_582_000, "Q_best": 98_310_000,  "rotations_best": 3, "reject_pct_best": 5.0, "source": "Baltic_best_base.log"},
+        "High": {"Z_best": -15_678_000, "Z_median": -11_509_000,"Q_best": 103_500_000, "rotations_best": 5, "reject_pct_best": 0.7},
+    },
+    "WAF": {
+        "Low":  {"Z_best": -115_361_000, "Z_median": -109_470_000, "Q_best": 345_800_000, "rotations_best": 7,  "reject_pct_best": 11.7},
+        "Base": {"Z_best": -143_110_000, "Z_median": -137_681_000, "Q_best": 370_600_000, "rotations_best": 11, "reject_pct_best": 4.7},
+        "High": {"Z_best": -159_944_000, "Z_median": -152_635_000, "Q_best": 382_000_000, "rotations_best": 11, "reject_pct_best": 1.6},
+    },
+    "Mediterranean": {
+        "Low":  {"Z_best": 29_504_000,  "Z_median": 42_636_000,  "Q_best": 128_900_000, "rotations_best": 7, "reject_pct_best": 7.4},
+        "Base": {"Z_best": 12_209_000,  "Z_median": 24_934_000,  "Q_best": 136_800_000, "rotations_best": 7, "reject_pct_best": 1.2},
+        "High": {"Z_best": 6_606_000,   "Z_median": 14_267_000,  "Q_best": 137_100_000, "rotations_best": 11,"reject_pct_best": 0.9},
+    },
+    "Pacific": {
+        "Low":  {"Z_best": 84_615_000,   "Z_median": 132_020_000,  "Q_best": 1_120_000_000, "rotations_best": 22, "reject_pct_best": 7.8},
+        "Base": {"Z_best": -54_087_000,  "Z_median": -12_774_000,  "Q_best": 1_197_000_000, "rotations_best": 21, "reject_pct_best": 3.1},
+        "High": {"Z_best": -101_671_000, "Z_median": -75_321_000,  "Q_best": 1_208_000_000, "rotations_best": 20, "reject_pct_best": 2.0},
+    },
+    "WorldSmall": {
+        "Low":  {"Z_best": -551_842_000,  "Z_median": -417_100_000,  "Q_best": 4_917_000_000, "rotations_best": 35, "reject_pct_best": 19.6},
+        "Base": {"Z_best": -888_669_000,  "Z_median": -888_669_000,  "Q_best": 5_199_000_000, "rotations_best": 40, "reject_pct_best": 14.8},
+        "High": {"Z_best": -1_168_067_000,"Z_median": -1_168_067_000,"Q_best": 5_266_000_000, "rotations_best": 37, "reject_pct_best": 13.1},
+    },
+    "EuropeAsia": {
+        "Low":  {"Z_best": -361_041_000,  "Z_median": -228_186_000,  "Q_best": 3_109_000_000, "rotations_best": 30, "reject_pct_best": 14.5},
+        "Base": {"Z_best": -657_972_000,  "Z_median": -561_417_000,  "Q_best": 3_283_000_000, "rotations_best": 35, "reject_pct_best": 10.4},
+        "High": {"Z_best": -766_385_000,  "Z_median": -670_099_000,  "Q_best": 3_390_000_000, "rotations_best": 37, "reject_pct_best": 7.6},
+    },
+}
+
 st.set_page_config(page_title="LINERLIB 班轮航运网络设计", layout="wide")
 st.title("LINERLIB 班轮航运网络设计")
 
@@ -159,7 +194,7 @@ with tab_map:
                 projection_scale=max(1, 150 / scale),
             )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     st.caption(f"当前显示 {len(demand_filtered)} 条需求航线（按 FFE/周 排序 Top {top_n_routes}）")
 
 # ========== Tab 2: 需求分析 ==========
@@ -171,7 +206,7 @@ with tab_demand:
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Histogram(x=demand["FFEPerWeek"], nbinsx=40, marker_color="steelblue"))
         fig_hist.update_layout(xaxis_title="FFE/周", yaxis_title="航线数", height=350)
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width='stretch')
 
     with col2:
         st.subheader("收入 vs 运量")
@@ -183,7 +218,7 @@ with tab_demand:
             hoverinfo="text+x+y",
         ))
         fig_scatter.update_layout(xaxis_title="FFE/周", yaxis_title="单箱收入", height=350)
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.plotly_chart(fig_scatter, width='stretch')
 
     st.subheader("港口吞吐量排名 (Top 20)")
     outbound = demand.groupby("Origin")["FFEPerWeek"].sum().rename("出口FFE/周")
@@ -196,15 +231,15 @@ with tab_demand:
     fig_bar.add_trace(go.Bar(x=throughput.index, y=throughput["出口FFE/周"], name="出口", marker_color="steelblue"))
     fig_bar.add_trace(go.Bar(x=throughput.index, y=throughput["进口FFE/周"], name="进口", marker_color="coral"))
     fig_bar.update_layout(barmode="stack", height=400, xaxis_title="港口", yaxis_title="FFE/周")
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width='stretch')
 
     st.subheader("需求数据明细")
-    st.dataframe(demand.sort_values("FFEPerWeek", ascending=False), use_container_width=True, height=300)
+    st.dataframe(demand.sort_values("FFEPerWeek", ascending=False), width='stretch', height=300)
 
 # ========== Tab 3: 船队信息 ==========
 with tab_fleet:
     st.subheader(f"{instance_name} 实例 -- 可用船队")
-    st.dataframe(fleet, use_container_width=True)
+    st.dataframe(fleet, width='stretch')
 
     col1, col2 = st.columns(2)
     with col1:
@@ -217,7 +252,7 @@ with tab_fleet:
             marker_color="darkorange",
         ))
         fig_fleet.update_layout(xaxis_title="船型", yaxis_title="容量 (FFE)", height=400)
-        st.plotly_chart(fig_fleet, use_container_width=True)
+        st.plotly_chart(fig_fleet, width='stretch')
 
     with col2:
         st.subheader("日租金 vs 容量")
@@ -231,7 +266,7 @@ with tab_fleet:
             marker=dict(size=fleet["Quantity"] * 3, color="purple", opacity=0.7),
         ))
         fig_tc.update_layout(xaxis_title="容量 (FFE)", yaxis_title="日租金 (USD)", height=400)
-        st.plotly_chart(fig_tc, use_container_width=True)
+        st.plotly_chart(fig_tc, width='stretch')
 
     total_capacity = (fleet["Capacity FFE"] * fleet["Quantity"]).sum()
     total_vessels = fleet["Quantity"].sum()
@@ -249,7 +284,7 @@ with tab_fleet:
                 "已部署": info["deployed"],
                 "闲置": info["available"] - info["deployed"],
             })
-        st.dataframe(pd.DataFrame(usage_data), use_container_width=True)
+        st.dataframe(pd.DataFrame(usage_data), width='stretch')
 
     col_m1, col_m2 = st.columns(2)
     with col_m1:
@@ -261,7 +296,7 @@ with tab_fleet:
 # ========== Tab 4: 港口详情 ==========
 with tab_ports:
     st.subheader("实例涉及港口")
-    st.dataframe(ports.sort_values("name"), use_container_width=True, height=400)
+    st.dataframe(ports.sort_values("name"), width='stretch', height=400)
 
     st.subheader("全部港口数据库")
     search = st.text_input("搜索港口 (名称或代码)")
@@ -272,7 +307,7 @@ with tab_ports:
             ports_all["UNLocode"].str.contains(search, case=False, na=False)
         )
         display_ports = ports_all[mask]
-    st.dataframe(display_ports.sort_values("name"), use_container_width=True, height=400)
+    st.dataframe(display_ports.sort_values("name"), width='stretch', height=400)
     st.caption(f"共 {len(display_ports)} 个港口")
 
 # ========== Tab 5: 求解器 ==========
@@ -297,7 +332,7 @@ with tab_solver:
         planning_horizon = st.number_input("规划期 (天)", value=180, step=30)
         reject_penalty = st.number_input("拒运惩罚 (USD/FFE)", value=1000, step=100)
 
-    if st.button("开始求解", type="primary", use_container_width=True):
+    if st.button("开始求解", type="primary", width='stretch'):
         from src.algorithm.solver import LsndSolver, SolverConfig
 
         config = SolverConfig(
@@ -359,6 +394,29 @@ with tab_results:
             st.metric("服务率", f"{sr:.1%}")
         with col4:
             st.metric("求解时间", f"{result.solve_time:.1f}s")
+            
+        # 与论文对比
+        benchmarks_all = PAPER_BENCHMARKS.get(result.instance_name)
+        if benchmarks_all:
+            st.subheader("与论文基准结果对比 (Table 9)")
+            scenario = st.selectbox("选择对比场景", list(benchmarks_all.keys()), index=list(benchmarks_all.keys()).index("Base") if "Base" in benchmarks_all else 0)
+            ref = benchmarks_all[scenario]
+            reject_pct = (result.flow_summary.get('rejected_ffe', 0) / result.flow_summary.get('total_demand_ffe', 1)) * 100
+
+            comp_col1, comp_col2, comp_col3 = st.columns(3)
+            with comp_col1:
+                delta_z = result.objective - ref['Z_best']
+                st.metric("目标函数值 (本轮 / 最优)", f"{result.objective:,.0f}", delta=f"{delta_z:,.0f} (距最优差距)", delta_color="inverse")
+            with comp_col2:
+                delta_r = len(result.rotations) - ref['rotations_best']
+                st.metric("航线数 (本轮 / 最优)", f"{len(result.rotations)} / {ref['rotations_best']}", delta=f"{delta_r} 条", delta_color="off")
+            with comp_col3:
+                delta_rej = reject_pct - ref['reject_pct_best']
+                st.metric("拒绝率 (本轮 / 最优)", f"{reject_pct:.1f}% / {ref['reject_pct_best']:.1f}%", delta=f"{delta_rej:.1f}%", delta_color="inverse")
+
+            st.markdown(f"**提示**: 该实例 {scenario} 场景论文中位数为 **{ref['Z_median']:,.0f}** USD。")
+            if "source" in ref:
+                st.caption(f"参考来源: {ref['source']}")
 
         # 成本分解表 (对标论文 Table 9)
         st.subheader("成本分解 (对标论文 Table 9)")
@@ -383,7 +441,7 @@ with tab_results:
                 "未被服务的需求总量",
             ],
         }
-        st.dataframe(pd.DataFrame(cost_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cost_data), width='stretch', hide_index=True)
 
         # 成本结构饼图
         cost_components = {
@@ -402,14 +460,109 @@ with tab_results:
                 hole=0.4,
             )])
             fig_pie.update_layout(title="成本结构", height=400)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width='stretch')
 
         # 航线详情
-        st.subheader("航线详情")
+        st.subheader("航线详情与可视化")
         if result.rotation_details:
             rot_df = pd.DataFrame(result.rotation_details)
             rot_df["port_calls"] = rot_df["port_calls"].apply(lambda x: " -> ".join(x))
-            st.dataframe(rot_df, use_container_width=True, hide_index=True)
+            st.dataframe(rot_df, width='stretch', hide_index=True)
+            
+            port_coords = ports_all.set_index("UNLocode")[["Longitude", "Latitude", "name"]].to_dict("index")
+            colors = px.colors.qualitative.Set2
+            
+            # 绘制整体网络图
+            st.markdown("#### 全局规划网络地图")
+            fig_all = go.Figure()
+            for idx, rot_detail in enumerate(result.rotation_details):
+                pc = rot_detail["port_calls"]
+                color = colors[idx % len(colors)]
+                for k in range(len(pc)):
+                    i_p = pc[k]
+                    j_p = pc[(k + 1) % len(pc)]
+                    if i_p in port_coords and j_p in port_coords:
+                        ic, jc = port_coords[i_p], port_coords[j_p]
+                        fig_all.add_trace(go.Scattergeo(
+                            lon=[ic["Longitude"], jc["Longitude"]],
+                            lat=[ic["Latitude"], jc["Latitude"]],
+                            mode="lines",
+                            line=dict(width=2, color=color),
+                            name=f"{rot_detail['id']}",
+                            showlegend=(k == 0),
+                        ))
+                rot_lons = [port_coords[p]["Longitude"] for p in pc if p in port_coords]
+                rot_lats = [port_coords[p]["Latitude"] for p in pc if p in port_coords]
+                rot_names = [port_coords[p]["name"] for p in pc if p in port_coords]
+                fig_all.add_trace(go.Scattergeo(
+                    lon=rot_lons, lat=rot_lats, mode="markers",
+                    marker=dict(size=8, color=color, line=dict(width=1, color="white")),
+                    hovertext=rot_names, hoverinfo="text", showlegend=False
+                ))
+            fig_all.update_layout(
+                geo=dict(showland=True, landcolor="rgb(243,243,243)", showcountries=True),
+                margin=dict(l=0, r=0, t=0, b=0), height=500
+            )
+            st.plotly_chart(fig_all, width='stretch')
+            
+            # 单独航线可视化
+            st.markdown("#### 单条航线排布可视化")
+            selected_rot = st.selectbox("选择要查看的航线", [rd["id"] for rd in result.rotation_details])
+            
+            current_rot = next((rd for rd in result.rotation_details if rd["id"] == selected_rot), None)
+            if current_rot:
+                fig_single = go.Figure()
+                pc = current_rot["port_calls"]
+                
+                # 绘制航线线段
+                for k in range(len(pc)):
+                    i_p = pc[k]
+                    j_p = pc[(k + 1) % len(pc)]
+                    if i_p in port_coords and j_p in port_coords:
+                        ic, jc = port_coords[i_p], port_coords[j_p]
+                        fig_single.add_trace(go.Scattergeo(
+                            lon=[ic["Longitude"], jc["Longitude"]],
+                            lat=[ic["Latitude"], jc["Latitude"]],
+                            mode="lines",
+                            line=dict(width=4, color="royalblue"),
+                            showlegend=False,
+                        ))
+                        
+                # 绘制港口点并添加序号
+                rot_lons = []
+                rot_lats = []
+                rot_texts = []
+                for idx, p in enumerate(pc):
+                    if p in port_coords:
+                        rot_lons.append(port_coords[p]["Longitude"])
+                        rot_lats.append(port_coords[p]["Latitude"])
+                        rot_texts.append(f"{idx+1}. {port_coords[p]['name']}")
+                
+                fig_single.add_trace(go.Scattergeo(
+                    lon=rot_lons, lat=rot_lats, mode="markers+text",
+                    marker=dict(size=14, color="crimson", line=dict(width=2, color="white")),
+                    text=rot_texts, textposition="top center",
+                    textfont=dict(size=12, color="darkred"),
+                    hoverinfo="text", showlegend=False
+                ))
+                
+                fig_single.update_layout(
+                    title=f"航线: {current_rot['id']} | 船型: {current_rot['vessel_class']} ({current_rot['num_vessels']}艘) | 速度: {current_rot['speed']}kn",
+                    geo=dict(showland=True, landcolor="rgb(243,243,243)", showcountries=True),
+                    margin=dict(l=0, r=0, t=40, b=0), height=400
+                )
+                
+                # 自动缩放到航线区域
+                if rot_lons and rot_lats:
+                    lon_center = sum(rot_lons) / len(rot_lons)
+                    lat_center = sum(rot_lats) / len(rot_lats)
+                    lon_range = max(rot_lons) - min(rot_lons)
+                    lat_range = max(rot_lats) - min(rot_lats)
+                    scale = max(lon_range, lat_range, 1)
+                    if scale < 60:
+                        fig_single.update_geos(center=dict(lon=lon_center, lat=lat_center), projection_scale=max(1, 150 / scale))
+                        
+                st.plotly_chart(fig_single, width='stretch')
         else:
             st.warning("未找到可用航线。")
 
@@ -424,6 +577,34 @@ with tab_results:
         with col3:
             st.metric("被拒绝 (FFE/规划期)", f"{fs.get('rejected_ffe', 0):,.0f}")
 
+        # 网络 KPI 指标 (对应论文 Table 11/12)
+        st.subheader("网络性能指标 (对应论文 Table 11/12)")
+        n_rotations = len(result.rotations)
+        total_demand = fs.get('total_demand_ffe', 0)
+        rejected_ffe = fs.get('rejected_ffe', 0)
+        reject_pct_kpi = (rejected_ffe / total_demand * 100) if total_demand > 0 else 0
+
+        # 计算 Dep% (船队部署比例)
+        total_deployed = sum(info.get("deployed", 0) for info in result.fleet_usage.values())
+        total_available = sum(info.get("available", 0) for info in result.fleet_usage.values())
+        dep_pct = (total_deployed / total_available * 100) if total_available > 0 else 0
+
+        # 计算 PCpW (每航线每周平均港口挂靠数)
+        total_port_calls = sum(len(rd["port_calls"]) for rd in result.rotation_details) if result.rotation_details else 0
+        pcpw = total_port_calls / max(n_rotations, 1)
+
+        kpi_data = {
+            "指标": ["Dep% (船队部署率)", "|R| (航线数)", "PCpW (平均停靠港数)", "Rej% (拒绝率)"],
+            "值": [f"{dep_pct:.1f}%", f"{n_rotations}", f"{pcpw:.2f}", f"{reject_pct_kpi:.1f}%"],
+            "说明": [
+                "已部署船舶 / 可用船舶总数",
+                "最终网络中的航线数量",
+                "每条航线平均停靠港口数",
+                "被拒绝运量 / 总需求量",
+            ],
+        }
+        st.dataframe(pd.DataFrame(kpi_data), width='stretch', hide_index=True)
+
         # 被拒绝需求
         if result.rejected_demand:
             rejected_items = [(o, d, v) for (o, d), v in result.rejected_demand.items() if v > 0.1]
@@ -431,7 +612,7 @@ with tab_results:
                 st.subheader(f"被拒绝需求 ({len(rejected_items)} 条)")
                 rej_df = pd.DataFrame(rejected_items, columns=["起点", "终点", "拒绝量 (FFE)"])
                 rej_df = rej_df.sort_values("拒绝量 (FFE)", ascending=False)
-                st.dataframe(rej_df, use_container_width=True, height=300, hide_index=True)
+                st.dataframe(rej_df, width='stretch', height=300, hide_index=True)
 
         # 导出结果
         st.subheader("导出结果")

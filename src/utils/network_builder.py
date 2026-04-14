@@ -55,6 +55,7 @@ class Rotation:
 @dataclass
 class MCFEdge:
     """多商品流图中的一条边。"""
+    edge_id: str         # 唯一边 ID
     source: str          # 源节点 ID
     target: str          # 目标节点 ID
     edge_type: str       # 'load', 'unload', 'transship', 'sail', 'omit'
@@ -140,6 +141,10 @@ def build_mcf_network(
         network.add_terminal_node(port_code)
 
     # 2. 为每条航线创建停靠节点和航行边
+    capacity_by_rotation = {
+        rot.id: total_capacity_of_rotation(rotations, rot.id, cost_calc, distances)
+        for rot in rotations
+    }
     for rot in rotations:
         call_node_ids = []
         for seq, port_code in enumerate(rot.port_calls):
@@ -148,17 +153,18 @@ def build_mcf_network(
 
         # 航行边 A_s: 连接航线内相邻停靠节点 (成本为 0，因为运营成本计入固定成本)
         n = len(call_node_ids)
+        round_trip_days = cost_calc.rotation_round_trip_time(
+            rot.vessel_class, rot.speed, rot.port_calls, distances
+        )
+        m_r = cost_calc.num_round_trips(round_trip_days)
+        total_capacity = capacity_by_rotation[rot.id]
+
         for k in range(n):
             src_id, src_port = call_node_ids[k]
             tgt_id, tgt_port = call_node_ids[(k + 1) % n]
-            capacity = rot.vessel_class.capacity * rot.num_vessels
-            round_trip_days = cost_calc.rotation_round_trip_time(
-                rot.vessel_class, rot.speed, rot.port_calls, distances
-            )
-            m_r = cost_calc.num_round_trips(round_trip_days)
-            total_capacity = rot.vessel_class.capacity * m_r * rot.num_vessels
 
             network.add_edge(MCFEdge(
+                edge_id=f"sail:{rot.id}:{k}",
                 source=src_id, target=tgt_id,
                 edge_type="sail", cost=0.0,
                 capacity=total_capacity,
@@ -175,17 +181,19 @@ def build_mcf_network(
 
             # 装货边: terminal -> call (成本 = 装货费 u_j)
             network.add_edge(MCFEdge(
+                edge_id=f"load:{rot.id}:{port_code}:{node_id.rsplit(':', 1)[-1]}",
                 source=terminal_id, target=node_id,
                 edge_type="load", cost=port.move_cost,
-                capacity=capacity,
+                capacity=total_capacity,
                 rotation_id=rot.id, port=port_code,
             ))
 
             # 卸货边: call -> terminal (成本 = 卸货费 u_j)
             network.add_edge(MCFEdge(
+                edge_id=f"unload:{rot.id}:{port_code}:{node_id.rsplit(':', 1)[-1]}",
                 source=node_id, target=terminal_id,
                 edge_type="unload", cost=port.move_cost,
-                capacity=capacity,
+                capacity=total_capacity,
                 rotation_id=rot.id, port=port_code,
             ))
 
@@ -200,11 +208,14 @@ def build_mcf_network(
                     # 提取航线 ID
                     src_rot = src_node.split(":")[1]
                     tgt_rot = tgt_node.split(":")[1]
+                    src_cap = capacity_by_rotation.get(src_rot, 0.0)
+                    tgt_cap = capacity_by_rotation.get(tgt_rot, 0.0)
                     # 转运边 (也包括蝴蝶航线内的 r=s 情况)
                     network.add_edge(MCFEdge(
+                        edge_id=f"transship:{src_node}->{tgt_node}",
                         source=src_node, target=tgt_node,
                         edge_type="transship", cost=port.transship_cost,
-                        capacity=float("inf"),
+                        capacity=min(src_cap, tgt_cap),
                         rotation_id=f"{src_rot}->{tgt_rot}",
                         port=port_code,
                     ))
@@ -214,6 +225,7 @@ def build_mcf_network(
         src = network.terminal_nodes.get(o, f"terminal:{o}")
         tgt = network.terminal_nodes.get(d, f"terminal:{d}")
         network.add_edge(MCFEdge(
+            edge_id=f"omit:{o}:{d}",
             source=src, target=tgt,
             edge_type="omit",
             cost=cost_calc.config.reject_penalty,
@@ -221,3 +233,20 @@ def build_mcf_network(
         ))
 
     return network
+
+
+def total_capacity_of_rotation(
+    rotations: List[Rotation],
+    rotation_id: str,
+    cost_calc: CostCalculator,
+    distances: Dict[Tuple[str, str], float],
+) -> float:
+    """Return total planning-horizon capacity for a rotation."""
+    for rot in rotations:
+        if rot.id != rotation_id:
+            continue
+        round_trip_days = cost_calc.rotation_round_trip_time(
+            rot.vessel_class, rot.speed, rot.port_calls, distances
+        )
+        return rot.vessel_class.capacity * cost_calc.num_round_trips(round_trip_days) * rot.num_vessels
+    return 0.0
