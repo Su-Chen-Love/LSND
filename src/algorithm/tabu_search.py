@@ -105,6 +105,7 @@ def score_rotations(
     rotations: List[Rotation],
     flow: Dict[str, Dict],
     capacities: Dict[str, float],
+    sail_edge_totals: Dict[str, float] = None,
     distances: Dict = None,
 ) -> Dict[str, float]:
     """
@@ -118,24 +119,37 @@ def score_rotations(
     返回: rotation_id -> score (越高越差，越应该被删除)
     """
     scores = {}
+    sail_edge_totals = sail_edge_totals or {}
+
     for rot in rotations:
         rot_flow = flow.get(rot.id, {})
         total_flow = sum(rot_flow.values())
-        cap = capacities.get(rot.id, rot.vessel_class.capacity)
+        cap = max(capacities.get(rot.id, rot.vessel_class.capacity), 1.0)
+        n_legs = max(len(rot.port_calls), 1)
 
-        # 标准 1: 利用率 (0 = 满载, 1 = 空载)
-        utilization = total_flow / max(cap, 1.0)
-        empty_ratio = 1.0 - min(utilization, 1.0)
+        per_leg_utils = []
+        for leg_idx in range(n_legs):
+            edge_id = f"sail:{rot.id}:{leg_idx}"
+            leg_total = sail_edge_totals.get(edge_id, 0.0)
+            per_leg_utils.append(min(leg_total / cap, 1.0))
 
-        # 标准 2: 空 FFE-miles — 航线总里程中未承载货物的比例
-        # 用总流量/容量 × 航线总腿数来近似
-        n_legs = len(rot.port_calls)
-        ffe_miles_score = empty_ratio * n_legs  # 空载里程与腿数成正比
+        if per_leg_utils:
+            avg_util = sum(per_leg_utils) / len(per_leg_utils)
+            empty_leg_ratio = sum(1.0 - u for u in per_leg_utils) / len(per_leg_utils)
+            low_util_share = sum(1 for u in per_leg_utils if u < 0.25) / len(per_leg_utils)
+        else:
+            avg_util = 0.0
+            empty_leg_ratio = 1.0
+            low_util_share = 1.0
 
-        # 标准 3: 成本效率 — 船数越多但流量越低越差
-        vessel_cost_score = rot.num_vessels / max(total_flow, 1.0) * cap
+        route_length_penalty = (n_legs / 6.0) if avg_util < 0.35 else 0.0
+        vessel_cost_score = min((rot.num_vessels * cap) / max(total_flow, 1.0), 3.0) / 3.0
 
-        # 综合评分: 加权组合 (越高越差)
-        scores[rot.id] = 0.4 * empty_ratio + 0.4 * (ffe_miles_score / max(n_legs, 1)) + 0.2 * min(vessel_cost_score, 1.0)
+        scores[rot.id] = (
+            0.45 * empty_leg_ratio
+            + 0.35 * low_util_share
+            + 0.10 * min(route_length_penalty, 1.0)
+            + 0.10 * vessel_cost_score
+        )
 
     return scores

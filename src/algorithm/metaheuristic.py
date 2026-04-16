@@ -16,6 +16,7 @@
 import time
 import logging
 import random
+import hashlib
 from itertools import combinations
 from typing import Dict, List, Tuple, Optional, Callable
 from dataclasses import dataclass, field
@@ -68,6 +69,16 @@ class IterationLog:
 
 
 @dataclass
+class CandidateMove:
+    """A fully evaluated move in the search neighborhood."""
+    additions: List[Rotation]
+    removals: List[Rotation]
+    objective: float
+    mcfp_result: MCFPResult
+    move_type: str
+
+
+@dataclass
 class MetaheuristicResult:
     """元启发式算法结果。"""
     best_rotations: List[Rotation]
@@ -83,6 +94,10 @@ class MetaheuristicResult:
     accepted_columns: int = 0
     same_class_swap_count: int = 0
     backtrack_count: int = 0
+    pair_moves_evaluated: int = 0
+    accepted_move_type: str = "none"
+    plateau_triggered: bool = False
+    candidate_pool_counts: Dict[str, int] = field(default_factory=dict)
 
 
 class LsndMetaheuristic:
@@ -141,6 +156,18 @@ class LsndMetaheuristic:
         mcf_evaluations = 0
         accepted_columns = 0
         same_class_swap_count = 0
+        pair_moves_evaluated = 0
+        accepted_move_type = "none"
+        plateau_triggered = False
+        aggregated_pool_counts = {
+            "aux_generated": 0,
+            "seed_simple_generated": 0,
+            "seed_butterfly_generated": 0,
+            "aux_selected": 0,
+            "seed_simple_selected": 0,
+            "seed_butterfly_selected": 0,
+        }
+        stagnation_count = 0
 
         rot_counter = 0
 
@@ -169,8 +196,14 @@ class LsndMetaheuristic:
             }
 
             # --- Step 2: 生成候选航线 (列生成) ---
-            candidates = []
+            aux_candidates = []
             suppress_subtour = iteration < cfg.suppress_subtour_iters
+            current_service_rate = 0.0
+            if current_mcfp is not None:
+                total_demand = max(sum(k for _, _, k, _ in self.demands), 1.0)
+                current_service_rate = 1.0 - sum(current_mcfp.residual_demand.values()) / total_demand
+            force_butterfly_priority = stagnation_count >= 3 and current_service_rate < 0.90
+            plateau_triggered = plateau_triggered or force_butterfly_priority
 
             # 端口聚类
             clusters = create_port_clusters(
@@ -234,15 +267,22 @@ class LsndMetaheuristic:
                         for eta in vessel_counts:
                             rot_id = f"rot_{rot_counter}"
                             rot_counter += 1
+                            dynamic_aux_limit = cfg.aux_num_solutions
+                            if (
+                                remaining_time >= 2.0 * cfg.aux_time_limit
+                                and stagnation_count >= 1
+                            ):
+                                dynamic_aux_limit = min(2, max(dynamic_aux_limit, 2))
                             for result in generator.solve_many(
                                 speed=float(s),
                                 num_vessels=eta,
                                 rotation_prefix=rot_id,
-                                limit=cfg.aux_num_solutions,
+                                limit=dynamic_aux_limit,
                             ):
+                                result = self._assign_unique_rotation_id(result, "aux", iteration, f"{cluster_idx}_{s}_{eta}")
                                 if self._candidate_potential_score(result, residual_demand, demand_revenue) <= 0:
                                     continue
-                                candidates.append(result)
+                                aux_candidates.append(result)
                                 unique_columns.add(self._rotation_signature(result))
 
                             # 时间检查
@@ -255,70 +295,82 @@ class LsndMetaheuristic:
                 if time.time() - start_time >= cfg.max_time:
                     break
 
-            total_columns += len(candidates)
-            seed_candidates = self._generate_seed_routes(residual_demand)
-            for seed_rot in seed_candidates:
-                sig = self._rotation_signature(seed_rot)
-                if sig in unique_columns:
-                    continue
-                candidates.append(seed_rot)
-                unique_columns.add(sig)
-            total_columns += len(seed_candidates)
-            candidates = self._select_candidate_subset(
-                candidates=candidates,
+            seed_pools = self._generate_seed_routes(
+                residual_demand=residual_demand,
+                iteration=iteration,
+                prefer_butterfly=force_butterfly_priority,
+            )
+
+            aggregated_pool_counts["aux_generated"] += len(aux_candidates)
+            aggregated_pool_counts["seed_simple_generated"] += len(seed_pools["seed_simple"])
+            aggregated_pool_counts["seed_butterfly_generated"] += len(seed_pools["seed_butterfly"])
+
+            candidate_sources = {}
+            dedup_aux = self._dedupe_candidates(aux_candidates, candidate_sources, "aux")
+            dedup_simple = self._dedupe_candidates(seed_pools["seed_simple"], candidate_sources, "seed_simple")
+            dedup_butterfly = self._dedupe_candidates(seed_pools["seed_butterfly"], candidate_sources, "seed_butterfly")
+            for rot in dedup_simple + dedup_butterfly:
+                unique_columns.add(self._rotation_signature(rot))
+
+            total_columns += len(aux_candidates) + len(seed_pools["seed_simple"]) + len(seed_pools["seed_butterfly"])
+            selected_pools = self._select_candidate_subset(
+                aux_candidates=dedup_aux,
+                seed_simple=dedup_simple,
+                seed_butterfly=dedup_butterfly,
                 residual_demand=residual_demand,
                 demand_revenue=demand_revenue,
-                limit=cfg.max_candidates_per_iteration,
+                limit=min(cfg.max_candidates_per_iteration, 18),
+                prefer_butterfly=force_butterfly_priority,
             )
-            logger.info(f"  Generated {len(candidates)} candidates")
+            candidates = selected_pools["combined"]
+            aggregated_pool_counts["aux_selected"] += len(selected_pools["aux"])
+            aggregated_pool_counts["seed_simple_selected"] += len(selected_pools["seed_simple"])
+            aggregated_pool_counts["seed_butterfly_selected"] += len(selected_pools["seed_butterfly"])
+            logger.info(
+                "  Generated %s candidates (aux=%s, simple=%s, butterfly=%s, plateau=%s)",
+                len(candidates),
+                len(selected_pools["aux"]),
+                len(selected_pools["seed_simple"]),
+                len(selected_pools["seed_butterfly"]),
+                force_butterfly_priority,
+            )
 
             # --- Step 3: 评估候选航线 ---
-            best_candidate = None
-            best_candidate_obj = float("inf")
-            best_candidate_mcfp = None
+            best_single_move = self._evaluate_move_set(
+                additions=[[cand] for cand in candidates],
+                current_rotations=current_rotations,
+                current_mcfp=current_mcfp,
+                start_time=start_time,
+                mcf_evaluations_ref=[mcf_evaluations],
+            )
+            mcf_evaluations = best_single_move[1]
+            best_single_move = best_single_move[0]
 
-            best_candidate_removed = []
-
-            for cand in candidates:
-                eval_scenarios = self._build_eval_scenarios(
-                    candidate=cand,
+            pair_candidates = candidates[:6]
+            pair_additions = [
+                [cand_a, cand_b]
+                for cand_a, cand_b in combinations(pair_candidates, 2)
+                if self._rotation_signature(cand_a) != self._rotation_signature(cand_b)
+            ][:8]
+            pair_moves_evaluated += len(pair_additions)
+            best_pair_move = None
+            if pair_additions:
+                best_pair_move, mcf_evaluations = self._evaluate_move_set(
+                    additions=pair_additions,
                     current_rotations=current_rotations,
                     current_mcfp=current_mcfp,
+                    start_time=start_time,
+                    mcf_evaluations_ref=[mcf_evaluations],
                 )
 
-                for test_rotations, removals in eval_scenarios:
-                    remaining_time = cfg.max_time - (time.time() - start_time)
-                    if remaining_time <= 1.0:
-                        break
-                    mcfp = MCFPSolver(
-                        rotations=test_rotations,
-                        ports_dict=self.ports_dict,
-                        demands=self.demands,
-                        dist_min=self.dist_min,
-                        config=self.cost_config,
-                        solver_backend=cfg.solver_backend,
-                    )
-
-                    try:
-                        mcfp_result = mcfp.solve(
-                            time_limit=max(1, min(cfg.mcfp_time_limit, int(max(remaining_time - 0.5, 1.0))))
-                        )
-                        mcf_evaluations += 1
-                    except Exception as e:
-                        logger.warning(f"  MCFP failed for {cand.id}: {e}")
-                        continue
-
-                    if mcfp_result.status != "Optimal":
-                        continue
-
-                    # 计算完整目标值 (包括航线固定成本)
-                    obj = self._compute_full_objective(test_rotations, mcfp_result)
-
-                    if obj < best_candidate_obj:
-                        best_candidate_obj = obj
-                        best_candidate = cand
-                        best_candidate_mcfp = mcfp_result
-                        best_candidate_removed = removals
+            best_move = best_single_move
+            if best_pair_move is not None:
+                if best_single_move is None:
+                    best_move = best_pair_move
+                else:
+                    threshold = best_single_move.objective - 0.005 * max(abs(best_single_move.objective), 1.0)
+                    if best_pair_move.objective < threshold:
+                        best_move = best_pair_move
 
                 # 时间检查
                 if time.time() - start_time >= cfg.max_time:
@@ -327,47 +379,51 @@ class LsndMetaheuristic:
             # --- Step 4: 更新航线集合 ---
             improved = False
             accepted = False
-            if best_candidate is not None and best_candidate_obj < current_objective:
-                for r_rm in best_candidate_removed:
+            if best_move is not None and best_move.objective < current_objective:
+                for r_rm in best_move.removals:
                     current_rotations.remove(r_rm)
                     logger.info(f"  SWAPPED OUT: {r_rm.id}")
-                current_rotations.append(best_candidate)
-                tabu_list.add(best_candidate.id, iteration)
-                current_objective = best_candidate_obj
-                current_mcfp = best_candidate_mcfp
+                for r_add in best_move.additions:
+                    current_rotations.append(r_add)
+                    tabu_list.add(r_add.id, iteration)
+                current_objective = best_move.objective
+                current_mcfp = best_move.mcfp_result
                 accepted = True
-                accepted_columns += 1
-                if best_candidate_removed:
+                accepted_columns += len(best_move.additions)
+                accepted_move_type = best_move.move_type
+                if best_move.removals:
                     same_class_swap_count += 1
 
                 # 更新残差需求
-                if best_candidate_mcfp:
-                    residual_demand = dict(best_candidate_mcfp.residual_demand)
+                if best_move.mcfp_result:
+                    residual_demand = dict(best_move.mcfp_result.residual_demand)
 
                 logger.info(f"  ACCEPTED: obj={current_objective:.0f}, "
-                            f"added {best_candidate.id}")
-            elif best_candidate is not None:
+                            f"added {[rot.id for rot in best_move.additions]} ({best_move.move_type})")
+            elif best_move is not None:
                 # 未改进但有候选: 有条件接受 (禁忌搜索的邻域探索)
                 # 论文策略: 只在目标值恶化不超过 5% 时接受，且限制连续非改进接受次数
                 tolerance = 0.05  # 允许 5% 的恶化
                 if current_objective != float("inf") and current_objective != 0:
-                    degradation = (best_candidate_obj - current_objective) / abs(current_objective)
+                    degradation = (best_move.objective - current_objective) / abs(current_objective)
                 else:
                     degradation = 0.0
                 if degradation <= tolerance:
-                    for r_rm in best_candidate_removed:
+                    for r_rm in best_move.removals:
                         current_rotations.remove(r_rm)
                         logger.info(f"  SWAPPED OUT (non-improving, {degradation:.1%}): {r_rm.id}")
-                    current_rotations.append(best_candidate)
-                    tabu_list.add(best_candidate.id, iteration)
-                    current_objective = best_candidate_obj
-                    current_mcfp = best_candidate_mcfp
+                    for r_add in best_move.additions:
+                        current_rotations.append(r_add)
+                        tabu_list.add(r_add.id, iteration)
+                    current_objective = best_move.objective
+                    current_mcfp = best_move.mcfp_result
                     accepted = True
-                    accepted_columns += 1
-                    if best_candidate_removed:
+                    accepted_columns += len(best_move.additions)
+                    accepted_move_type = best_move.move_type
+                    if best_move.removals:
                         same_class_swap_count += 1
-                    if best_candidate_mcfp:
-                        residual_demand = dict(best_candidate_mcfp.residual_demand)
+                    if best_move.mcfp_result:
+                        residual_demand = dict(best_move.mcfp_result.residual_demand)
                 else:
                     logger.info(f"  Rejected non-improving candidate ({degradation:.1%} degradation)")
 
@@ -376,6 +432,9 @@ class LsndMetaheuristic:
                 best_rotations = list(current_rotations)
                 best_mcfp = current_mcfp
                 improved = True
+                stagnation_count = 0
+            else:
+                stagnation_count += 1
 
             backtrack_mgr.update_best(best_rotations, best_objective)
 
@@ -385,7 +444,12 @@ class LsndMetaheuristic:
                 # 计算航线评分
                 flow = best_mcfp.leg_flow if best_mcfp else {}
                 caps = {rot.id: rot.vessel_class.capacity for rot in current_rotations}
-                scores = score_rotations(current_rotations, flow, caps)
+                scores = score_rotations(
+                    current_rotations,
+                    flow,
+                    caps,
+                    sail_edge_totals=best_mcfp.sail_edge_totals if best_mcfp else {},
+                )
                 current_rotations = backtrack_mgr.backtrack(scores)
                 if current_rotations:
                     recomputed_mcfp = MCFPSolver(
@@ -435,7 +499,7 @@ class LsndMetaheuristic:
                 iteration=iteration,
                 n_rotations=len(current_rotations),
                 n_candidates=len(candidates),
-                objective=best_candidate_obj if best_candidate else float("inf"),
+                objective=best_move.objective if best_move else float("inf"),
                 best_objective=best_objective,
                 improved=improved,
                 elapsed_sec=time.time() - start_time,
@@ -457,6 +521,10 @@ class LsndMetaheuristic:
             accepted_columns=accepted_columns,
             same_class_swap_count=same_class_swap_count,
             backtrack_count=backtrack_mgr.backtrack_count,
+            pair_moves_evaluated=pair_moves_evaluated,
+            accepted_move_type=accepted_move_type,
+            plateau_triggered=plateau_triggered,
+            candidate_pool_counts=aggregated_pool_counts,
         )
 
     def _compute_full_objective(
@@ -516,59 +584,142 @@ class LsndMetaheuristic:
 
     @staticmethod
     def _rotation_signature(rotation: Rotation) -> Tuple:
+        if rotation.is_butterfly and rotation.butterfly_port in rotation.port_calls:
+            occurrences = [idx for idx, port in enumerate(rotation.port_calls) if port == rotation.butterfly_port]
+            if occurrences:
+                start = occurrences[0]
+                ordered_calls = tuple(rotation.port_calls[start:] + rotation.port_calls[:start])
+            else:
+                ordered_calls = RouteGenerator.canonicalize_port_calls(rotation.port_calls)
+        else:
+            ordered_calls = RouteGenerator.canonicalize_port_calls(rotation.port_calls)
         return (
             rotation.vessel_class.name,
             round(rotation.speed, 2),
             rotation.num_vessels,
-            tuple(rotation.port_calls),
+            ordered_calls,
             rotation.is_butterfly,
             rotation.butterfly_port,
         )
 
+    def _assign_unique_rotation_id(
+        self,
+        rotation: Rotation,
+        family: str,
+        iteration: int,
+        template: str,
+    ) -> Rotation:
+        signature = self._rotation_signature(rotation)
+        signature_hash = hashlib.md5(repr(signature).encode("utf-8")).hexdigest()[:12]
+        return Rotation(
+            id=(
+                f"{family}_it{iteration}_{rotation.vessel_class.name}_"
+                f"{int(round(rotation.speed * 10))}_{rotation.num_vessels}_"
+                f"{rotation.butterfly_port or 'none'}_{template}_{signature_hash}"
+            ),
+            vessel_class=rotation.vessel_class,
+            speed=rotation.speed,
+            num_vessels=rotation.num_vessels,
+            port_calls=list(rotation.port_calls),
+            is_butterfly=rotation.is_butterfly,
+            butterfly_port=rotation.butterfly_port,
+        )
+
+    def _dedupe_candidates(
+        self,
+        candidates: List[Rotation],
+        source_map: Dict[Tuple, str],
+        source_name: str,
+    ) -> List[Rotation]:
+        deduped = []
+        for rot in candidates:
+            sig = self._rotation_signature(rot)
+            if sig in source_map:
+                continue
+            source_map[sig] = source_name
+            deduped.append(rot)
+        return deduped
+
     def _build_eval_scenarios(
         self,
-        candidate: Rotation,
+        additions: List[Rotation],
         current_rotations: List[Rotation],
         current_mcfp: Optional[MCFPResult],
     ) -> List[Tuple[List[Rotation], List[Rotation]]]:
-        """Build route-removal scenarios for evaluating a candidate column."""
-        cand_v = candidate.vessel_class.name
-        current_used = sum(r.num_vessels for r in current_rotations if r.vessel_class.name == cand_v)
-        needed = candidate.num_vessels
-        if current_used + needed <= candidate.vessel_class.quantity:
-            return [(current_rotations + [candidate], [])]
-
-        same_class = [r for r in current_rotations if r.vessel_class.name == cand_v]
-        if not same_class:
-            return []
+        """Build route-removal scenarios for one or more candidate columns."""
+        added_by_class: Dict[str, int] = {}
+        vessel_by_class: Dict[str, VesselClass] = {}
+        for rot in additions:
+            added_by_class[rot.vessel_class.name] = added_by_class.get(rot.vessel_class.name, 0) + rot.num_vessels
+            vessel_by_class[rot.vessel_class.name] = rot.vessel_class
 
         utilization = self._route_utilization_map(current_rotations, current_mcfp)
-        ranked_same_class = sorted(
-            same_class,
-            key=lambda rot: (utilization.get(rot.id, 0.0), rot.num_vessels, rot.id),
-        )
+        removal_options_by_class: Dict[str, List[List[Rotation]]] = {}
 
-        combos = []
-        seen = set()
-        for size in (1, 2):
-            if size > len(ranked_same_class):
+        for vessel_name, needed in added_by_class.items():
+            current_used = sum(r.num_vessels for r in current_rotations if r.vessel_class.name == vessel_name)
+            quantity = vessel_by_class[vessel_name].quantity
+            overflow = current_used + needed - quantity
+            if overflow <= 0:
+                removal_options_by_class[vessel_name] = [[]]
                 continue
-            for combo in combinations(ranked_same_class, size):
-                freed = sum(rot.num_vessels for rot in combo)
-                if current_used - freed + needed > candidate.vessel_class.quantity:
-                    continue
-                combo_ids = tuple(sorted(rot.id for rot in combo))
-                if combo_ids in seen:
-                    continue
-                seen.add(combo_ids)
-                avg_util = sum(utilization.get(rot.id, 0.0) for rot in combo) / len(combo)
-                combos.append((avg_util, len(combo), list(combo)))
 
-        combos.sort(key=lambda item: (item[0], item[1], tuple(rot.id for rot in item[2])))
-        return [
-            ([rot for rot in current_rotations if rot not in removals] + [candidate], removals)
-            for _, _, removals in combos
-        ]
+            same_class = [r for r in current_rotations if r.vessel_class.name == vessel_name]
+            if not same_class:
+                return []
+
+            ranked_same_class = sorted(
+                same_class,
+                key=lambda rot: (utilization.get(rot.id, 0.0), rot.num_vessels, rot.id),
+            )
+            combos = []
+            seen = set()
+            low_util = ranked_same_class[0]
+            if low_util.num_vessels >= overflow:
+                combos.append([low_util])
+                seen.add((low_util.id,))
+
+            for size in (1, 2):
+                if size > len(ranked_same_class):
+                    continue
+                for combo in combinations(ranked_same_class, size):
+                    freed = sum(rot.num_vessels for rot in combo)
+                    if freed < overflow:
+                        continue
+                    combo_ids = tuple(sorted(rot.id for rot in combo))
+                    if combo_ids in seen:
+                        continue
+                    seen.add(combo_ids)
+                    combos.append(list(combo))
+            combos.sort(
+                key=lambda combo: (
+                    sum(utilization.get(rot.id, 0.0) for rot in combo) / max(len(combo), 1),
+                    len(combo),
+                    tuple(rot.id for rot in combo),
+                )
+            )
+            removal_options_by_class[vessel_name] = combos
+
+        scenarios = []
+        seen_scenarios = set()
+        option_lists = list(removal_options_by_class.values()) or [[[]]]
+        for removal_bundle in self._cartesian_removals(option_lists):
+            removal_set = []
+            seen_ids = set()
+            for combo in removal_bundle:
+                for rot in combo:
+                    if rot.id not in seen_ids:
+                        seen_ids.add(rot.id)
+                        removal_set.append(rot)
+            scenario_key = tuple(sorted(rot.id for rot in removal_set))
+            if scenario_key in seen_scenarios:
+                continue
+            seen_scenarios.add(scenario_key)
+            scenarios.append((
+                [rot for rot in current_rotations if rot not in removal_set] + additions,
+                removal_set,
+            ))
+        return scenarios
 
     @staticmethod
     def _route_utilization_map(
@@ -601,47 +752,112 @@ class LsndMetaheuristic:
             score += qty * max(demand_revenue.get((o, d), 0.0), 0.0)
         return score
 
+    def _candidate_structure_score(
+        self,
+        candidate: Rotation,
+        residual_demand: Dict[Tuple[str, str], float],
+        demand_revenue: Dict[Tuple[str, str], float],
+        prefer_butterfly: bool = False,
+    ) -> float:
+        base = self._candidate_potential_score(candidate, residual_demand, demand_revenue)
+        fixed_cost = self._estimate_candidate_fixed_cost(candidate)
+        port_counts = {}
+        for port in candidate.port_calls:
+            port_counts[port] = port_counts.get(port, 0) + 1
+
+        repeated_penalty = sum(max(count - 1, 0) for count in port_counts.values())
+        unique_ports = len(set(candidate.port_calls))
+        excess_port_penalty = max(len(candidate.port_calls) - 6, 0)
+        weak_two_port_penalty = 1.0 if unique_ports <= 2 else 0.0
+        hub_return_bonus = 0.0
+        bilateral_spoke_bonus = 0.0
+        if candidate.butterfly_port:
+            hub_return_bonus = 0.08 * max(base - fixed_cost, 0.0)
+            left = candidate.port_calls[:candidate.port_calls.index(candidate.butterfly_port)]
+            right = candidate.port_calls[candidate.port_calls.index(candidate.butterfly_port) + 1:]
+            if len(set(left)) >= 2 and len(set(right)) >= 2:
+                bilateral_spoke_bonus = 0.06 * max(base - fixed_cost, 0.0)
+            if prefer_butterfly:
+                hub_return_bonus += 0.03 * max(base - fixed_cost, 0.0)
+
+        simple_bonus = 0.02 * max(base - fixed_cost, 0.0) if len(candidate.port_calls) in (5, 6) else 0.0
+        efficiency_bonus = min(base / max(fixed_cost, 1.0), 5.0) * 250_000.0
+        return (
+            base
+            - 1.25 * fixed_cost
+            + hub_return_bonus
+            + bilateral_spoke_bonus
+            + simple_bonus
+            + efficiency_bonus
+            - repeated_penalty * 400_000.0
+            - weak_two_port_penalty * 2_500_000.0
+            - excess_port_penalty * 300_000.0
+        )
+
+    def _estimate_candidate_fixed_cost(self, candidate: Rotation) -> float:
+        v = candidate.vessel_class
+        n = candidate.num_vessels
+        T = self.cost_config.planning_horizon
+        total = v.tc_rate * T * n
+
+        round_trip_days = self.cost_calc.rotation_round_trip_time(
+            v, candidate.speed, candidate.port_calls, self.dist_min
+        )
+        m_r = self.cost_calc.num_round_trips(round_trip_days)
+        for idx in range(len(candidate.port_calls)):
+            i_p = candidate.port_calls[idx]
+            j_p = candidate.port_calls[(idx + 1) % len(candidate.port_calls)]
+            dist = self.dist_min.get((i_p, j_p), 0.0)
+            total += m_r * n * (
+                self.cost_calc.sailing_fuel_cost(v, candidate.speed, dist)
+                + self.cost_calc.port_idle_fuel_cost(v)
+            )
+            port = self.ports_dict.get(j_p)
+            if port:
+                total += m_r * n * self.cost_calc.port_call_cost(v, port)
+            is_panama, is_suez = self.canal_info.get((i_p, j_p), (False, False))
+            total += m_r * n * self.cost_calc.canal_cost(v, is_panama, is_suez)
+        return total
+
     def _select_candidate_subset(
         self,
-        candidates: List[Rotation],
+        aux_candidates: List[Rotation],
+        seed_simple: List[Rotation],
+        seed_butterfly: List[Rotation],
         residual_demand: Dict[Tuple[str, str], float],
         demand_revenue: Dict[Tuple[str, str], float],
         limit: int,
-    ) -> List[Rotation]:
+        prefer_butterfly: bool = False,
+    ) -> Dict[str, List[Rotation]]:
         """Keep a diverse, high-value subset of candidates for MCF evaluation."""
-        if len(candidates) <= limit:
-            return candidates
+        pools = {
+            "aux": sorted(
+                aux_candidates,
+                key=lambda rot: self._candidate_structure_score(rot, residual_demand, demand_revenue, prefer_butterfly),
+                reverse=True,
+            )[:10],
+            "seed_simple": sorted(
+                seed_simple,
+                key=lambda rot: self._candidate_structure_score(rot, residual_demand, demand_revenue, prefer_butterfly),
+                reverse=True,
+            )[:10],
+            "seed_butterfly": sorted(
+                seed_butterfly,
+                key=lambda rot: self._candidate_structure_score(rot, residual_demand, demand_revenue, prefer_butterfly),
+                reverse=True,
+            )[:10],
+        }
 
-        potential_sorted = sorted(
-            candidates,
-            key=lambda rot: self._candidate_potential_score(rot, residual_demand, demand_revenue),
-            reverse=True,
-        )
-        structural_sorted = sorted(
-            candidates,
-            key=lambda rot: (
-                1 if rot.is_butterfly else 0,
-                len(set(rot.port_calls)),
-                len(rot.port_calls),
-                self._candidate_potential_score(rot, residual_demand, demand_revenue),
-            ),
+        combined = pools["aux"] + pools["seed_simple"] + pools["seed_butterfly"]
+        combined = sorted(
+            combined,
+            key=lambda rot: self._candidate_structure_score(rot, residual_demand, demand_revenue, prefer_butterfly),
             reverse=True,
         )
 
         selected = []
         seen = set()
-        half = max(1, limit // 2)
-        for pool in (potential_sorted[:half], structural_sorted[: limit - half]):
-            for rot in pool:
-                sig = self._rotation_signature(rot)
-                if sig in seen:
-                    continue
-                selected.append(rot)
-                seen.add(sig)
-                if len(selected) >= limit:
-                    return selected
-
-        for rot in potential_sorted:
+        for rot in combined:
             sig = self._rotation_signature(rot)
             if sig in seen:
                 continue
@@ -649,12 +865,21 @@ class LsndMetaheuristic:
             seen.add(sig)
             if len(selected) >= limit:
                 break
-        return selected
+        selected_signatures = {self._rotation_signature(rot) for rot in selected}
+
+        return {
+            "aux": [rot for rot in pools["aux"] if self._rotation_signature(rot) in selected_signatures],
+            "seed_simple": [rot for rot in pools["seed_simple"] if self._rotation_signature(rot) in selected_signatures],
+            "seed_butterfly": [rot for rot in pools["seed_butterfly"] if self._rotation_signature(rot) in selected_signatures],
+            "combined": selected,
+        }
 
     def _generate_seed_routes(
         self,
         residual_demand: Dict[Tuple[str, str], float],
-    ) -> List[Rotation]:
+        iteration: int,
+        prefer_butterfly: bool = False,
+    ) -> Dict[str, List[Rotation]]:
         """
         Generate hub-oriented seed routes that complement AUX candidates.
 
@@ -672,8 +897,9 @@ class LsndMetaheuristic:
             bilateral[(o, d)] = bilateral.get((o, d), 0.0) + qty
             bilateral[(d, o)] = bilateral.get((d, o), 0.0) + qty
 
-        hubs = [port for port, _ in sorted(port_totals.items(), key=lambda item: item[1], reverse=True)[:2]]
-        seeds = []
+        hubs = [port for port, _ in sorted(port_totals.items(), key=lambda item: item[1], reverse=True)[:3]]
+        simple_seeds: List[Rotation] = []
+        butterfly_seeds: List[Rotation] = []
         seen = set()
 
         for vessel in self.vessels:
@@ -692,18 +918,21 @@ class LsndMetaheuristic:
 
                     candidate_paths = []
                     if len(spokes) >= 2:
-                        candidate_paths.append([hub, spokes[0], spokes[1]])
+                        candidate_paths.append(("simple2", [hub, spokes[0], spokes[1]]))
                     if len(spokes) >= 3:
-                        candidate_paths.append([hub, spokes[0], spokes[1], spokes[2]])
+                        candidate_paths.append(("simple3", [hub, spokes[0], spokes[1], spokes[2]]))
+                        candidate_paths.append(("hub_return", [hub, spokes[0], hub, spokes[1], spokes[2]]))
                     if len(spokes) >= 4:
-                        candidate_paths.append([hub, spokes[0], spokes[1], hub, spokes[2], spokes[3]])
+                        candidate_paths.append(("butterfly4", [hub, spokes[0], spokes[1], hub, spokes[2], spokes[3]]))
+                    if prefer_butterfly and len(spokes) >= 4:
+                        candidate_paths.append(("butterfly_alt", [hub, spokes[0], hub, spokes[1], spokes[2], spokes[3]]))
 
-                    for path in candidate_paths:
+                    for template, path in candidate_paths:
                         if not self._frequency_feasible(vessel, speed, eta, path):
                             continue
                         butterfly_port = hub if path.count(hub) > 1 else None
-                        rot = Rotation(
-                            id=f"seed_{vessel.name}_{eta}_{hub}_{len(path)}",
+                        raw_rot = Rotation(
+                            id=f"seed_tmp_{vessel.name}_{eta}_{hub}_{template}",
                             vessel_class=vessel,
                             speed=speed,
                             num_vessels=eta,
@@ -711,12 +940,82 @@ class LsndMetaheuristic:
                             is_butterfly=butterfly_port is not None,
                             butterfly_port=butterfly_port,
                         )
+                        rot = self._assign_unique_rotation_id(raw_rot, "seed", iteration, template)
                         sig = self._rotation_signature(rot)
                         if sig in seen:
                             continue
                         seen.add(sig)
-                        seeds.append(rot)
-        return seeds
+                        if rot.is_butterfly:
+                            butterfly_seeds.append(rot)
+                        else:
+                            simple_seeds.append(rot)
+        return {
+            "seed_simple": simple_seeds,
+            "seed_butterfly": butterfly_seeds,
+        }
+
+    def _evaluate_move_set(
+        self,
+        additions: List[List[Rotation]],
+        current_rotations: List[Rotation],
+        current_mcfp: Optional[MCFPResult],
+        start_time: float,
+        mcf_evaluations_ref: List[int],
+    ) -> Tuple[Optional[CandidateMove], int]:
+        best_move = None
+        mcf_evaluations = mcf_evaluations_ref[0]
+        for move_additions in additions:
+            eval_scenarios = self._build_eval_scenarios(
+                additions=move_additions,
+                current_rotations=current_rotations,
+                current_mcfp=current_mcfp,
+            )
+            for test_rotations, removals in eval_scenarios:
+                remaining_time = self.meta_config.max_time - (time.time() - start_time)
+                if remaining_time <= 1.0:
+                    break
+                mcfp = MCFPSolver(
+                    rotations=test_rotations,
+                    ports_dict=self.ports_dict,
+                    demands=self.demands,
+                    dist_min=self.dist_min,
+                    config=self.cost_config,
+                    solver_backend=self.meta_config.solver_backend,
+                )
+                try:
+                    mcfp_result = mcfp.solve(
+                        time_limit=max(1, min(self.meta_config.mcfp_time_limit, int(max(remaining_time - 0.5, 1.0))))
+                    )
+                    mcf_evaluations += 1
+                except Exception as e:
+                    logger.warning("  MCFP failed for move %s: %s", [rot.id for rot in move_additions], e)
+                    continue
+                if mcfp_result.status != "Optimal":
+                    continue
+
+                obj = self._compute_full_objective(test_rotations, mcfp_result)
+                if best_move is None or obj < best_move.objective:
+                    best_move = CandidateMove(
+                        additions=move_additions,
+                        removals=removals,
+                        objective=obj,
+                        mcfp_result=mcfp_result,
+                        move_type="pair" if len(move_additions) > 1 else "single",
+                    )
+            if time.time() - start_time >= self.meta_config.max_time:
+                break
+        return best_move, mcf_evaluations
+
+    @staticmethod
+    def _cartesian_removals(option_lists: List[List[List[Rotation]]]) -> List[List[List[Rotation]]]:
+        results = [[]]
+        for options in option_lists:
+            next_results = []
+            for prefix in results:
+                for option in options:
+                    next_results.append(prefix + [option])
+            results = next_results
+        return results
 
     def _frequency_feasible(
         self,

@@ -236,6 +236,133 @@ def test_aux_multiple_candidates():
     print("  [OK] AUX 多候选枚举正常")
 
 
+def test_seed_route_id_uniqueness():
+    """seed route 应有稳定唯一的 id，且签名去重后不重复。"""
+    from src.data_reader import load_instance, load_distances
+    from src.algorithm.metaheuristic import LsndMetaheuristic, MetaheuristicConfig
+    from src.algorithm.tabu_search import TabuConfig
+    from src.utils.cost_calculator import CostConfig, build_distance_dict, build_ports_from_data, build_vessels_from_data
+
+    data = load_instance("Baltic", scenario="base")
+    vessels = build_vessels_from_data(data["fleet"])
+    ports_dict = build_ports_from_data(data["ports_all"])
+    _, dist_min, canal_info = build_distance_dict(load_distances())
+    weeks = 180 / 7.0
+    demands = [
+        (row["Origin"], row["Destination"], float(row["FFEPerWeek"]) * weeks, float(row["Revenue_1"]))
+        for _, row in data["demand"].iterrows()
+    ]
+    solver = LsndMetaheuristic(
+        vessels=vessels,
+        ports_dict=ports_dict,
+        demands=demands,
+        dist_min=dist_min,
+        canal_info=canal_info,
+        cost_config=CostConfig(),
+        meta_config=MetaheuristicConfig(max_time=5),
+        tabu_config=TabuConfig(),
+    )
+    residual = {(o, d): k for o, d, k, _ in demands}
+    pools = solver._generate_seed_routes(residual, iteration=3, prefer_butterfly=True)
+    seeds = pools["seed_simple"] + pools["seed_butterfly"]
+
+    ids = [rot.id for rot in seeds]
+    signatures = [solver._rotation_signature(rot) for rot in seeds]
+    assert len(ids) == len(set(ids))
+    assert len(signatures) == len(set(signatures))
+
+    print("  [OK] seed route 唯一性正常")
+
+
+def test_mcfp_constraint_naming_uniqueness():
+    """相同形状但不同 rotation id 的网络应能稳定求解，不出现约束名冲突。"""
+    from src.model.mcfp import MCFPSolver
+    from src.utils.cost_calculator import VesselClass, Port, CostConfig
+    from src.utils.network_builder import Rotation
+
+    vessel = VesselClass(
+        name="Fixture", capacity=100, tc_rate=5000, draft=8.0,
+        min_speed=10, max_speed=14, design_speed=12.0,
+        fuel_design=18.8, fuel_idle=2.4,
+        panama_fee=0, suez_fee=0, quantity=4,
+    )
+    ports = {
+        "A": Port("A", "A", 0.0, 0.0, 10.0, 10.0, 20.0, 100.0, 0.0),
+        "B": Port("B", "B", 1.0, 1.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+        "C": Port("C", "C", 2.0, 2.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+    }
+    rotations = [
+        Rotation(id="seed_alpha", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "B", "C"]),
+        Rotation(id="seed_beta", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "B", "C"]),
+    ]
+    solver = MCFPSolver(
+        rotations=rotations,
+        ports_dict=ports,
+        demands=[("A", "C", 40.0, 100.0), ("B", "A", 10.0, 80.0)],
+        dist_min={
+            ("A", "B"): 100.0, ("B", "C"): 120.0, ("C", "A"): 140.0,
+            ("B", "A"): 100.0, ("C", "B"): 120.0, ("A", "C"): 140.0,
+        },
+        config=CostConfig(planning_horizon=180, reject_penalty=1000.0),
+    )
+    result = solver.solve(time_limit=30)
+
+    assert result.status == "Optimal", result.status
+    assert isinstance(result.sail_edge_totals, dict)
+
+    print("  [OK] MCFP 约束命名唯一性正常")
+
+
+def test_pair_move_scenarios():
+    """pair 邻域应能为同船型双列加入生成最小删除组合。"""
+    from src.algorithm.metaheuristic import LsndMetaheuristic, MetaheuristicConfig
+    from src.algorithm.tabu_search import TabuConfig
+    from src.utils.cost_calculator import VesselClass, Port, CostConfig
+    from src.utils.network_builder import Rotation
+
+    vessel = VesselClass(
+        name="Fixture", capacity=100, tc_rate=5000, draft=8.0,
+        min_speed=10, max_speed=14, design_speed=12.0,
+        fuel_design=18.8, fuel_idle=2.4,
+        panama_fee=0, suez_fee=0, quantity=3,
+    )
+    ports = {
+        "A": Port("A", "A", 0.0, 0.0, 10.0, 10.0, 20.0, 100.0, 0.0),
+        "B": Port("B", "B", 1.0, 1.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+        "C": Port("C", "C", 2.0, 2.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+        "D": Port("D", "D", 3.0, 3.0, 10.0, 15.0, 25.0, 100.0, 0.0),
+    }
+    demands = [("A", "C", 50.0, 100.0), ("B", "D", 50.0, 100.0)]
+    solver = LsndMetaheuristic(
+        vessels=[vessel],
+        ports_dict=ports,
+        demands=demands,
+        dist_min={
+            ("A", "B"): 100.0, ("B", "C"): 100.0, ("C", "A"): 100.0,
+            ("A", "D"): 100.0, ("D", "B"): 100.0, ("B", "A"): 100.0,
+            ("C", "D"): 100.0, ("D", "A"): 100.0, ("C", "B"): 100.0,
+        },
+        canal_info={},
+        cost_config=CostConfig(),
+        meta_config=MetaheuristicConfig(max_time=5),
+        tabu_config=TabuConfig(),
+    )
+    current = [
+        Rotation(id="r1", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "B", "C"]),
+        Rotation(id="r2", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "D", "B"]),
+    ]
+    additions = [
+        Rotation(id="n1", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["A", "C", "D"]),
+        Rotation(id="n2", vessel_class=vessel, speed=12.0, num_vessels=1, port_calls=["B", "D", "C"]),
+    ]
+
+    scenarios = solver._build_eval_scenarios(additions, current, current_mcfp=None)
+    assert scenarios, "pair scenarios should not be empty"
+    assert any(len(removals) == 1 for _, removals in scenarios), scenarios
+
+    print("  [OK] pair 邻域场景生成正常")
+
+
 def test_solver_baltic():
     """测试在 Baltic 实例上的完整求解。"""
     from src.algorithm.solver import solve_instance
@@ -296,6 +423,9 @@ if __name__ == "__main__":
         ("Baltic 论文回放", test_baltic_paper_replay),
         ("AUX 蝴蝶提取", test_aux_butterfly_extraction),
         ("AUX 多候选枚举", test_aux_multiple_candidates),
+        ("seed route 唯一性", test_seed_route_id_uniqueness),
+        ("MCFP 约束命名唯一性", test_mcfp_constraint_naming_uniqueness),
+        ("pair 邻域场景", test_pair_move_scenarios),
         ("Baltic 实例求解", test_solver_baltic),
     ]
 

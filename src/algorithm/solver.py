@@ -76,6 +76,10 @@ class SolverResult:
     accepted_columns: int = 0
     same_class_swap_count: int = 0
     backtrack_count: int = 0
+    pair_moves_evaluated: int = 0
+    accepted_move_type: str = "none"
+    plateau_triggered: bool = False
+    candidate_pool_counts: Dict[str, int] = field(default_factory=dict)
     paper_gap_pct: Optional[float] = None
     diagnostics_path: Optional[str] = None
 
@@ -192,6 +196,10 @@ class LsndSolver:
             accepted_columns=result.accepted_columns,
             same_class_swap_count=result.same_class_swap_count,
             backtrack_count=result.backtrack_count,
+            pair_moves_evaluated=result.pair_moves_evaluated,
+            accepted_move_type=result.accepted_move_type,
+            plateau_triggered=result.plateau_triggered,
+            candidate_pool_counts=result.candidate_pool_counts,
         )
         self._write_diagnostics(solver_result)
         return solver_result
@@ -320,7 +328,11 @@ class LsndSolver:
                       mcf_evaluations=0,
                       accepted_columns=0,
                       same_class_swap_count=0,
-                      backtrack_count=0) -> SolverResult:
+                      backtrack_count=0,
+                      pair_moves_evaluated=0,
+                      accepted_move_type="none",
+                      plateau_triggered=False,
+                      candidate_pool_counts=None) -> SolverResult:
         """构建统一的 SolverResult。"""
         cost_calc = CostCalculator(self.cost_config)
 
@@ -410,6 +422,10 @@ class LsndSolver:
             accepted_columns=accepted_columns,
             same_class_swap_count=same_class_swap_count,
             backtrack_count=backtrack_count,
+            pair_moves_evaluated=pair_moves_evaluated,
+            accepted_move_type=accepted_move_type,
+            plateau_triggered=plateau_triggered,
+            candidate_pool_counts=candidate_pool_counts or {},
             diagnostics_path=str(diagnostics_path) if diagnostics_path else None,
         )
 
@@ -482,6 +498,10 @@ class LsndSolver:
             "accepted_columns": result.accepted_columns,
             "same_class_swap_count": result.same_class_swap_count,
             "backtrack_count": result.backtrack_count,
+            "pair_moves_evaluated": result.pair_moves_evaluated,
+            "accepted_move_type": result.accepted_move_type,
+            "plateau_triggered": result.plateau_triggered,
+            "candidate_pool_counts": result.candidate_pool_counts,
             "flow_summary": result.flow_summary,
             "cost_breakdown": result.cost_breakdown.__dict__,
             "rotations": result.rotation_details,

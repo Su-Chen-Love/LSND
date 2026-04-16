@@ -1,0 +1,281 @@
+{
+  "instance": "WAF",
+  "scenario": "base",
+  "seed": 7,
+  "method": "metaheuristic",
+  "status": "Optimal",
+  "objective": -107930300.00851718,
+  "solver_backend": "cbc",
+  "solve_time": 60.04259896278381,
+  "iterations": 5,
+  "columns_evaluated": 56,
+  "unique_columns": 47,
+  "mcf_evaluations": 80,
+  "accepted_columns": 8,
+  "same_class_swap_count": 0,
+  "backtrack_count": 0,
+  "pair_moves_evaluated": 40,
+  "accepted_move_type": "pair",
+  "plateau_triggered": false,
+  "candidate_pool_counts": {
+    "aux_generated": 14,
+    "seed_simple_generated": 36,
+    "seed_butterfly_generated": 6,
+    "aux_selected": 14,
+    "seed_simple_selected": 36,
+    "seed_butterfly_selected": 6
+  },
+  "flow_summary": {
+    "total_demand_ffe": 219625.7142857143,
+    "transported_ffe": 173816.9247647143,
+    "rejected_ffe": 45808.789521,
+    "service_rate": 0.791423378314405,
+    "n_rotations": 8
+  },
+  "cost_breakdown": {
+    "Z": -107930300.89731151,
+    "Q": 298412021.1350643,
+    "c_v": 31680000.0,
+    "c_b": 49872128.539964266,
+    "c_p": 10523275.898748528,
+    "c_c": 0.0,
+    "c_m": 73837526.27804,
+    "c_t": 0.0,
+    "L_v": 21240000.0,
+    "F": 45808.789521
+  },
+  "rotations": [
+    {
+      "id": "seed_it0_Feeder_800_140_3_ESALG_butterfly4_3ae9e525fe61",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "NGAPP",
+        "GHTKD",
+        "ESALG",
+        "BJCOO",
+        "SNDKR"
+      ],
+      "round_trip_days": 41.7,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it0_Feeder_800_140_3_ESALG_hub_return_bec9c4288bf6",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "NGAPP",
+        "ESALG",
+        "GHTKD",
+        "BJCOO"
+      ],
+      "round_trip_days": 40.4,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it1_Feeder_800_140_3_ESALG_hub_return_68b527fbcd25",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "ESALG",
+        "NGAPP",
+        "AOLAD"
+      ],
+      "round_trip_days": 44.8,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it1_Feeder_800_140_2_none_simple2_1b5479c53ae9",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 2,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "NGAPP"
+      ],
+      "round_trip_days": 20.9,
+      "frequency": "biweekly",
+      "is_butterfly": false
+    },
+    {
+      "id": "seed_it2_Feeder_800_140_3_ESALG_butterfly4_67cc9feaf5a4",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "CIABJ",
+        "CMDLA",
+        "ESALG",
+        "TGLFW",
+        "SNDKR"
+      ],
+      "round_trip_days": 43.7,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it2_Feeder_800_140_3_ESALG_hub_return_32f8a7342155",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "CIABJ",
+        "ESALG",
+        "CMDLA",
+        "TGLFW"
+      ],
+      "round_trip_days": 40.4,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it3_Feeder_800_140_2_none_simple3_0b0c87113428",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 2,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "AOLOB",
+        "GNCKY"
+      ],
+      "round_trip_days": 28.9,
+      "frequency": "biweekly",
+      "is_butterfly": false
+    },
+    {
+      "id": "seed_it3_Feeder_800_140_3_ESALG_hub_return_66ad932ee032",
+      "vessel_class": "Feeder_800",
+      "num_vessels": 3,
+      "speed": 14.0,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "ESALG",
+        "AOLOB",
+        "GNCKY"
+      ],
+      "round_trip_days": 45.7,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    }
+  ],
+  "selected_rotation_signatures": [
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "NGAPP",
+        "GHTKD",
+        "ESALG",
+        "BJCOO",
+        "SNDKR"
+      ],
+      "butterfly_port": "ESALG"
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "NGAPP",
+        "ESALG",
+        "GHTKD",
+        "BJCOO"
+      ],
+      "butterfly_port": "ESALG"
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "ESALG",
+        "NGAPP",
+        "AOLAD"
+      ],
+      "butterfly_port": "ESALG"
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 2,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "NGAPP"
+      ],
+      "butterfly_port": null
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "CIABJ",
+        "CMDLA",
+        "ESALG",
+        "TGLFW",
+        "SNDKR"
+      ],
+      "butterfly_port": "ESALG"
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "CIABJ",
+        "ESALG",
+        "CMDLA",
+        "TGLFW"
+      ],
+      "butterfly_port": "ESALG"
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 2,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "AOLOB",
+        "GNCKY"
+      ],
+      "butterfly_port": null
+    },
+    {
+      "vessel_class": "Feeder_800",
+      "speed": 14.0,
+      "num_vessels": 3,
+      "port_calls": [
+        "ESALG",
+        "GHTKD",
+        "ESALG",
+        "AOLOB",
+        "GNCKY"
+      ],
+      "butterfly_port": "ESALG"
+    }
+  ]
+}

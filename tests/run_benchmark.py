@@ -122,6 +122,9 @@ def print_single(result: SolverResult):
     print(f"  迭代次数: {result.iterations}")
     print(f"  候选列: {result.columns_evaluated} | 唯一列: {result.unique_columns} | MCF评估: {result.mcf_evaluations}")
     print(f"  接受列: {result.accepted_columns} | same-class swaps: {result.same_class_swap_count} | backtracks: {result.backtrack_count}")
+    print(f"  pair moves: {result.pair_moves_evaluated} | accepted move: {result.accepted_move_type} | plateau: {result.plateau_triggered}")
+    if result.candidate_pool_counts:
+        print(f"  candidate pools: {result.candidate_pool_counts}")
     if result.diagnostics_path:
         print(f"  诊断文件: {result.diagnostics_path}")
 
@@ -176,6 +179,9 @@ def print_summary(results: List[SolverResult], instance: str, scenario: str):
     print(f"  最佳后端: {sorted_by_obj[0].solver_backend}")
     print(f"  中位候选列: {median_result.columns_evaluated} | 唯一列: {median_result.unique_columns} | MCF评估: {median_result.mcf_evaluations}")
     print(f"  中位接受列: {median_result.accepted_columns} | same-class swaps: {median_result.same_class_swap_count} | backtracks: {median_result.backtrack_count}")
+    print(f"  中位 pair moves: {median_result.pair_moves_evaluated} | accepted move: {median_result.accepted_move_type} | plateau: {median_result.plateau_triggered}")
+    if median_result.candidate_pool_counts:
+        print(f"  中位 candidate pools: {median_result.candidate_pool_counts}")
     if ref:
         best_gap = paper_gap_pct(sorted_by_obj[0], ref)
         med_gap = paper_gap_pct(median_result, ref)

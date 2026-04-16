@@ -4,38 +4,49 @@
   "seed": 7,
   "method": "metaheuristic",
   "status": "Optimal",
-  "objective": 1831030.0488503575,
+  "objective": 1390749.366870854,
   "solver_backend": "cbc",
-  "solve_time": 20.011748790740967,
-  "iterations": 13,
-  "columns_evaluated": 226,
-  "unique_columns": 100,
-  "mcf_evaluations": 86,
+  "solve_time": 20.006091833114624,
+  "iterations": 27,
+  "columns_evaluated": 575,
+  "unique_columns": 115,
+  "mcf_evaluations": 107,
   "accepted_columns": 3,
   "same_class_swap_count": 0,
-  "backtrack_count": 2,
+  "backtrack_count": 5,
+  "pair_moves_evaluated": 216,
+  "accepted_move_type": "single",
+  "plateau_triggered": true,
+  "candidate_pool_counts": {
+    "aux_generated": 66,
+    "seed_simple_generated": 265,
+    "seed_butterfly_generated": 244,
+    "aux_selected": 27,
+    "seed_simple_selected": 218,
+    "seed_butterfly_selected": 238
+  },
   "flow_summary": {
     "total_demand_ffe": 126102.85714285714,
-    "transported_ffe": 110416.76606285715,
-    "rejected_ffe": 15686.09108,
-    "service_rate": 0.8756087575222041,
+    "transported_ffe": 109561.59463285714,
+    "rejected_ffe": 16541.26251,
+    "service_rate": 0.8688272186310495,
     "n_rotations": 3
   },
   "cost_breakdown": {
-    "Z": 1831029.785564633,
-    "Q": 90865588.7048857,
+    "Z": 1390749.4434851203,
+    "Q": 90705745.82898574,
     "c_v": 6480000.0,
-    "c_b": 9503199.642236643,
-    "c_p": 9575707.465153709,
+    "c_b": 9799160.499034442,
+    "c_p": 8026740.6056764135,
     "c_c": 0.0,
-    "c_m": 51451620.303059995,
+    "c_m": 51249331.65776,
     "c_t": 0.0,
     "L_v": 0.0,
-    "F": 15686.09108
+    "F": 16541.26251
   },
   "rotations": [
     {
-      "id": "seed_Feeder_800_2_DEBRV_6",
+      "id": "seed_it0_Feeder_800_140_2_DEBRV_butterfly4_12bfee948671",
       "vessel_class": "Feeder_800",
       "num_vessels": 2,
       "speed": 14.0,
@@ -52,9 +63,25 @@
       "is_butterfly": true
     },
     {
-      "id": "seed_Feeder_450_3_DEBRV_6",
+      "id": "seed_it0_Feeder_450_120_2_DEBRV_hub_return_4f8472626dec",
       "vessel_class": "Feeder_450",
-      "num_vessels": 3,
+      "num_vessels": 2,
+      "speed": 12.0,
+      "port_calls": [
+        "DEBRV",
+        "RULED",
+        "DEBRV",
+        "SEGOT",
+        "DKAAR"
+      ],
+      "round_trip_days": 16.5,
+      "frequency": "biweekly",
+      "is_butterfly": true
+    },
+    {
+      "id": "seed_it1_Feeder_450_120_2_DEBRV_butterfly4_88e8fd280243",
+      "vessel_class": "Feeder_450",
+      "num_vessels": 2,
       "speed": 12.0,
       "port_calls": [
         "DEBRV",
@@ -62,25 +89,11 @@
         "PLGDY",
         "DEBRV",
         "RUKGD",
-        "SEGOT"
-      ],
-      "round_trip_days": 20.7,
-      "frequency": "weekly",
-      "is_butterfly": true
-    },
-    {
-      "id": "rot_68_0",
-      "vessel_class": "Feeder_450",
-      "num_vessels": 1,
-      "speed": 12.0,
-      "port_calls": [
-        "DEBRV",
-        "SEGOT",
         "NOSVG"
       ],
-      "round_trip_days": 6.4,
-      "frequency": "weekly",
-      "is_butterfly": false
+      "round_trip_days": 21.4,
+      "frequency": "biweekly",
+      "is_butterfly": true
     }
   ],
   "selected_rotation_signatures": [
@@ -101,27 +114,29 @@
     {
       "vessel_class": "Feeder_450",
       "speed": 12.0,
-      "num_vessels": 3,
+      "num_vessels": 2,
       "port_calls": [
         "DEBRV",
         "RULED",
-        "PLGDY",
         "DEBRV",
-        "RUKGD",
-        "SEGOT"
+        "SEGOT",
+        "DKAAR"
       ],
       "butterfly_port": "DEBRV"
     },
     {
       "vessel_class": "Feeder_450",
       "speed": 12.0,
-      "num_vessels": 1,
+      "num_vessels": 2,
       "port_calls": [
         "DEBRV",
-        "SEGOT",
+        "RULED",
+        "PLGDY",
+        "DEBRV",
+        "RUKGD",
         "NOSVG"
       ],
-      "butterfly_port": null
+      "butterfly_port": "DEBRV"
     }
   ],
   "paper_replay_comparison": {

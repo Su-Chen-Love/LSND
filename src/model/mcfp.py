@@ -30,6 +30,7 @@ class MCFPResult:
     total_reject_penalty: float
     flow: Dict[str, Dict[Tuple[str, str], float]]
     leg_flow: Dict[str, Dict[Tuple[str, str], float]]
+    sail_edge_totals: Dict[str, float]
     rejected: Dict[Tuple[str, str], float]
     residual_demand: Dict[Tuple[str, str], float]
     active_backend: str = "cbc"
@@ -81,6 +82,14 @@ class MCFPSolver:
         load_edges = [e for e in network.edges if e.edge_type == "load"]
         unload_edges = [e for e in network.edges if e.edge_type == "unload"]
         omit_edges = {e.edge_id: e for e in network.edges if e.edge_type == "omit"}
+        sail_edge_by_id = {edge.edge_id: edge for edge in sail_edges}
+        transship_edge_by_id = {edge.edge_id: edge for edge in transship_edges}
+        load_edge_by_id = {edge.edge_id: edge for edge in load_edges}
+        unload_edge_by_id = {edge.edge_id: edge for edge in unload_edges}
+        sail_edge_names = {edge.edge_id: f"sail_{idx}" for idx, edge in enumerate(sail_edges)}
+        transship_edge_names = {edge.edge_id: f"trans_{idx}" for idx, edge in enumerate(transship_edges)}
+        load_edge_names = {edge.edge_id: f"load_{idx}" for idx, edge in enumerate(load_edges)}
+        unload_edge_names = {edge.edge_id: f"unload_{idx}" for idx, edge in enumerate(unload_edges)}
 
         revenue_by_od = {(o, d): q for o, d, _, q in self.demands}
         quantity_by_od = {(o, d): k for o, d, k, _ in self.demands}
@@ -105,20 +114,20 @@ class MCFPSolver:
             for edge in load_edges:
                 if edge.source != source:
                     continue
-                var = pulp.LpVariable(f"V_{edge.edge_id}_{o}_{d}", lowBound=0)
+                var = pulp.LpVariable(f"V_{load_edge_names[edge.edge_id]}_{o}_{d}", lowBound=0)
                 V[(edge.edge_id, o, d)] = var
                 obj += (edge.cost - revenue_by_od[(o, d)]) * var
                 self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
 
             # Sailing edges are commodity-specific across all call nodes.
             for edge in sail_edges:
-                var = pulp.LpVariable(f"X_{edge.edge_id}_{o}_{d}", lowBound=0)
+                var = pulp.LpVariable(f"X_{sail_edge_names[edge.edge_id]}_{o}_{d}", lowBound=0)
                 X[(edge.edge_id, o, d)] = var
                 self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
 
             # Transshipment edges are commodity-specific as well.
             for edge in transship_edges:
-                var = pulp.LpVariable(f"U_{edge.edge_id}_{o}_{d}", lowBound=0)
+                var = pulp.LpVariable(f"U_{transship_edge_names[edge.edge_id]}_{o}_{d}", lowBound=0)
                 U[(edge.edge_id, o, d)] = var
                 obj += edge.cost * var
                 self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
@@ -127,7 +136,7 @@ class MCFPSolver:
             for edge in unload_edges:
                 if edge.target != sink:
                     continue
-                var = pulp.LpVariable(f"W_{edge.edge_id}_{o}_{d}", lowBound=0)
+                var = pulp.LpVariable(f"W_{unload_edge_names[edge.edge_id]}_{o}_{d}", lowBound=0)
                 W[(edge.edge_id, o, d)] = var
                 obj += edge.cost * var
                 self._append_arc(node_outgoing, node_incoming, edge.source, edge.target, o, d, var)
@@ -169,26 +178,26 @@ class MCFPSolver:
         for edge in sail_edges:
             model += (
                 pulp.lpSum(X[(edge.edge_id, o, d)] for o, d, _, _ in self.demands) <= edge.capacity,
-                f"cap_sail_{edge.edge_id.replace(':', '_')}",
+                f"cap_{sail_edge_names[edge.edge_id]}",
             )
         for edge in transship_edges:
             model += (
                 pulp.lpSum(U[(edge.edge_id, o, d)] for o, d, _, _ in self.demands) <= edge.capacity,
-                f"cap_trans_{edge.edge_id.replace(':', '_')}",
+                f"cap_{transship_edge_names[edge.edge_id]}",
             )
         for edge in load_edges:
             relevant = [V[(edge.edge_id, o, d)] for o, d, _, _ in self.demands if (edge.edge_id, o, d) in V]
             if relevant:
                 model += (
                     pulp.lpSum(relevant) <= edge.capacity,
-                    f"cap_load_{edge.edge_id.replace(':', '_')}",
+                    f"cap_{load_edge_names[edge.edge_id]}",
                 )
         for edge in unload_edges:
             relevant = [W[(edge.edge_id, o, d)] for o, d, _, _ in self.demands if (edge.edge_id, o, d) in W]
             if relevant:
                 model += (
                     pulp.lpSum(relevant) <= edge.capacity,
-                    f"cap_unload_{edge.edge_id.replace(':', '_')}",
+                    f"cap_{unload_edge_names[edge.edge_id]}",
                 )
 
         solver, selection = build_pulp_solver(
@@ -205,6 +214,7 @@ class MCFPSolver:
         residual = {}
         flow = {}
         leg_flow = {}
+        sail_edge_totals = {}
         total_revenue = 0.0
         total_handling = 0.0
         total_transship = 0.0
@@ -225,7 +235,7 @@ class MCFPSolver:
             val = pulp.value(var) or 0.0
             if val <= 0.001:
                 continue
-            edge = next(e for e in load_edges if e.edge_id == edge_id)
+            edge = load_edge_by_id[edge_id]
             total_handling += edge.cost * val
             flow.setdefault(edge.rotation_id, {})[(o, d)] = flow.setdefault(edge.rotation_id, {}).get((o, d), 0.0) + val
 
@@ -233,22 +243,23 @@ class MCFPSolver:
             val = pulp.value(var) or 0.0
             if val <= 0.001:
                 continue
-            edge = next(e for e in unload_edges if e.edge_id == edge_id)
+            edge = unload_edge_by_id[edge_id]
             total_handling += edge.cost * val
 
         for (edge_id, o, d), var in U.items():
             val = pulp.value(var) or 0.0
             if val <= 0.001:
                 continue
-            edge = next(e for e in transship_edges if e.edge_id == edge_id)
+            edge = transship_edge_by_id[edge_id]
             total_transship += edge.cost * val
 
         for (edge_id, o, d), var in X.items():
             val = pulp.value(var) or 0.0
             if val <= 0.001:
                 continue
-            edge = next(e for e in sail_edges if e.edge_id == edge_id)
+            edge = sail_edge_by_id[edge_id]
             leg_flow.setdefault(edge.rotation_id, {})[(o, d)] = leg_flow.setdefault(edge.rotation_id, {}).get((o, d), 0.0) + val
+            sail_edge_totals[edge_id] = sail_edge_totals.get(edge_id, 0.0) + val
 
         return MCFPResult(
             status=status,
@@ -259,6 +270,7 @@ class MCFPSolver:
             total_reject_penalty=total_penalty,
             flow=flow,
             leg_flow=leg_flow,
+            sail_edge_totals=sail_edge_totals,
             rejected=rejected,
             residual_demand=residual,
             active_backend=selection.active,
